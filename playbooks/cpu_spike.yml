@@ -11,7 +11,7 @@
 
 - name: PiQuickHeal - cpu_spike
   hosts: all
-  become: true
+  # become: true
   vars:
     cpu_recover_threshold: 15   # matches recover_threshold.cpu_percent: -15
 
