@@ -1,0 +1,133 @@
+---
+# Equivalent of PLAYBOOKS["cpu_spike"] from playbooks.py.
+#
+# AWX wiring:
+#   Job Template A: "piquickheal-cpu_spike-diagnose"  -> tags: diagnose
+#   Job Template B: "piquickheal-cpu_spike-remediate" -> tags: remediate,validate
+#   Workflow Template: A -> [Approval] -> B   (requires_approval: True in the source)
+#
+# Run against a single host by passing -l <hostname> (AWX: "limit" field,
+# same as your AWX_TEMPLATE_MAP -> launch call already does).
+
+- name: PiQuickHeal - cpu_spike
+  hosts: all
+  become: true
+  vars:
+    cpu_recover_threshold: 15   # matches recover_threshold.cpu_percent: -15
+
+  tasks:
+
+    # ── Stage 1: DIAGNOSE (tags: diagnose) ──────────────────────────────
+    # Equivalent to the Python "phase": "diagnose" command. Always succeeds
+    # (changed_when: false) since this only reads state, never changes it.
+    - name: "STAGE 1 - Diagnose top CPU consumer"
+      tags: [diagnose]
+      changed_when: false
+      shell: |
+        set -o pipefail
+        echo '[STAGE 1 - DIAGNOSIS]'
+        uptime
+        ps aux --sort=-%cpu | head -11
+        TOP_PID=$(ps aux --sort=-%cpu --no-headers | awk 'NR==1{print $2}')
+        TOP_CMD=$(ps aux --sort=-%cpu --no-headers | awk 'NR==1{print $11}')
+        TOP_CPU=$(ps aux --sort=-%cpu --no-headers | awk 'NR==1{print $3}')
+        TOP_NAME=$(basename "$TOP_CMD" 2>/dev/null || echo "$TOP_CMD")
+        PROTECTED='{{ protected_processes | join(" ") }}'
+        IS_PROT=false
+        for P in $PROTECTED; do echo "$TOP_NAME" | grep -qi "$P" && IS_PROT=true && break; done
+        if [ "$IS_PROT" = true ]; then
+          TOTAL=$(pgrep -xc "$TOP_NAME" 2>/dev/null || echo 0)
+          echo "PROTECTED_PROCESS_FOUND:${TOP_NAME} PID:${TOP_PID} METRIC:${TOP_CPU}% TOTAL_INSTANCES:${TOTAL}"
+          for IPID in $(pgrep -x "$TOP_NAME" 2>/dev/null); do
+            ISTATS=$(ps -p "$IPID" -o pcpu=,pmem= 2>/dev/null)
+            [ -z "$ISTATS" ] && continue
+            ICPU=$(echo $ISTATS | awk '{print $1}')
+            IMEM=$(echo $ISTATS | awk '{print $2}')
+            echo "PROTECTED_INSTANCE:${TOP_NAME} PID:${IPID} CPU:${ICPU}% MEM:${IMEM}%"
+          done
+          echo Top_process_is_protected_no_remediation_will_be_proposed
+        else
+          echo "Top_process_not_protected:${TOP_NAME} PID:${TOP_PID} METRIC:${TOP_CPU}%"
+        fi
+        echo '[/STAGE 1]'
+      register: diagnose_result
+
+    - name: "STAGE 1 - Show diagnosis output"
+      tags: [diagnose]
+      debug:
+        var: diagnose_result.stdout_lines
+
+    - name: "STAGE 1 - Flag whether the top process is protected"
+      tags: [diagnose]
+      set_fact:
+        top_process_protected: "{{ 'PROTECTED_PROCESS_FOUND' in diagnose_result.stdout }}"
+
+    # AWX picks up this fact via set_stats so the workflow (or your
+    # orchestrator polling the job's artifacts) can decide whether to even
+    # show the approval node, same as _detect_protected_top_process() does
+    # in the Python version.
+    - name: "STAGE 1 - Publish result for the workflow/orchestrator"
+      tags: [diagnose]
+      set_stats:
+        data:
+          top_process_protected: "{{ top_process_protected }}"
+
+    # ── Stage 2: KILL (tags: remediate) ─────────────────────────────────
+    # Only reached after AWX's Approval node has been approved.
+    - name: "STAGE 2 - Kill top CPU consumer"
+      tags: [remediate]
+      when: not top_process_protected | default(false)
+      shell: |
+        set -o pipefail
+        echo '[STAGE 2 - KILL]'
+        TOP_PID=$(ps aux --sort=-%cpu --no-headers | awk 'NR==1{print $2}')
+        TOP_CMD=$(ps aux --sort=-%cpu --no-headers | awk 'NR==1{print $11}')
+        TOP_CPU=$(ps aux --sort=-%cpu --no-headers | awk 'NR==1{print $3}')
+        TOP_NAME=$(basename "$TOP_CMD" 2>/dev/null || echo "$TOP_CMD")
+        echo "Target: $TOP_NAME (PID $TOP_PID) using ${TOP_CPU}% CPU"
+        echo "Sending SIGKILL to all $TOP_NAME processes..."
+        pkill -9 -x "$TOP_NAME" 2>/dev/null && echo "pkill -9 $TOP_NAME: done" || echo "pkill: no match (may already be gone)"
+        kill -9 $TOP_PID 2>/dev/null && echo "kill -9 PID $TOP_PID: done" || echo "PID $TOP_PID already gone"
+        PGID=$(ps -p $TOP_PID -o pgid= 2>/dev/null | tr -d ' ')
+        [ -n "$PGID" ] && [ "$PGID" -gt 1 ] && kill -9 -$PGID 2>/dev/null && echo "kill -9 PGID $PGID: done" || true
+        sleep 1
+        REMAINING=$(pgrep -xc "$TOP_NAME" 2>/dev/null || echo 0)
+        echo "Remaining $TOP_NAME processes: $REMAINING"
+        echo '[/STAGE 2]'
+      register: kill_result
+
+    - name: "STAGE 2 - Show kill output"
+      tags: [remediate]
+      debug:
+        var: kill_result.stdout_lines
+      when: not top_process_protected | default(false)
+
+    # ── Stage 3: VALIDATE (tags: validate) ──────────────────────────────
+    - name: "STAGE 3 - Poll CPU until it recovers"
+      tags: [validate]
+      when: not top_process_protected | default(false)
+      shell: |
+        top -bn1 | grep -i 'cpu' | head -1 | \
+          awk '{for(i=1;i<=NF;i++) if($i~/^[0-9]/ && $(i+1)~/id/) print 100-$i}'
+      register: cpu_check
+      until: (cpu_check.stdout | default('100') | float) < cpu_recover_threshold
+      retries: 6
+      delay: 5
+      changed_when: false
+      failed_when: false
+
+    - name: "STAGE 3 - Record heal result to the same log file the Python version used"
+      tags: [validate]
+      when: not top_process_protected | default(false)
+      shell: >
+        echo "$(date '+%Y-%m-%d %H:%M:%S IST')
+        [{{ 'HEALED' if (cpu_check.stdout | default('100') | float) < cpu_recover_threshold else 'HEAL_FAILED' }} cpu_spike]
+        $(hostname) >> {{ heal_log_path }}"
+
+    - name: "STAGE 3 - Report outcome"
+      tags: [validate]
+      when: not top_process_protected | default(false)
+      debug:
+        msg: >-
+          {{ 'HEAL_CONFIRMED_CPU_below_threshold' if (cpu_check.stdout | default('100') | float) < cpu_recover_threshold
+             else 'HEAL_FAILED_CPU_still_elevated' }}

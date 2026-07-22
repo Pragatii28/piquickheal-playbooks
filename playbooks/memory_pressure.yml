@@ -1,0 +1,153 @@
+---
+# Equivalent of PLAYBOOKS["memory_pressure"] from playbooks.py.
+#
+# AWX wiring:
+#   Job Template A: "piquickheal-memory_pressure-diagnose" -> tags: diagnose
+#   Job Template B: "piquickheal-memory_pressure-remediate" -> tags: remediate
+#   Workflow Template: A -> [Approval] -> B   (requires_approval: True in the source)
+
+- name: PiQuickHeal - memory_pressure
+  hosts: all
+  become: true
+
+  tasks:
+
+    # ── Stage 1: DIAGNOSE (tags: diagnose) ──────────────────────────────
+    - name: "STAGE 1 - Diagnose top memory consumer"
+      tags: [diagnose]
+      changed_when: false
+      shell: |
+        set -o pipefail
+        echo '[STAGE 1 - DIAGNOSIS]'
+        free -h
+        echo '--- Top memory processes ---'
+        ps aux --sort=-%mem | head -11
+        df -h | grep -E 'tmpfs|/tmp|/dev/shm'
+        dmesg 2>/dev/null | grep -i 'oom' | tail -3 || echo 'No OOM events'
+        TOP_PID=$(ps aux --sort=-%mem --no-headers | awk 'NR==1{print $2}')
+        TOP_CMD=$(ps aux --sort=-%mem --no-headers | awk 'NR==1{print $11}')
+        TOP_MEM=$(ps aux --sort=-%mem --no-headers | awk 'NR==1{print $4}')
+        TOP_BASENAME=$(basename "$TOP_CMD" 2>/dev/null || echo "$TOP_CMD")
+        echo "--- Top consumer: $TOP_BASENAME (PID $TOP_PID) using ${TOP_MEM}% MEM ---"
+        PROTECTED='{{ protected_processes | join(" ") }}'
+        TOP_IS_PROTECTED=false
+        for P in $PROTECTED; do
+          echo "$TOP_BASENAME" | grep -qi "$P" && TOP_IS_PROTECTED=true && break
+        done
+        if [ "$TOP_IS_PROTECTED" = true ]; then
+          echo "--- PROTECTED: $TOP_BASENAME is on this server's protected-process list ---"
+          TOTAL=$(pgrep -xc "$TOP_BASENAME" 2>/dev/null || echo 0)
+          echo "PROTECTED_PROCESS_FOUND:${TOP_BASENAME} PID:${TOP_PID} METRIC:${TOP_MEM}% TOTAL_INSTANCES:${TOTAL}"
+          for IPID in $(pgrep -x "$TOP_BASENAME" 2>/dev/null); do
+            ISTATS=$(ps -p "$IPID" -o pcpu=,pmem= 2>/dev/null)
+            [ -z "$ISTATS" ] && continue
+            ICPU=$(echo $ISTATS | awk '{print $1}')
+            IMEM=$(echo $ISTATS | awk '{print $2}')
+            echo "PROTECTED_INSTANCE:${TOP_BASENAME} PID:${IPID} CPU:${ICPU}% MEM:${IMEM}%"
+          done
+          echo Top_process_is_protected_no_remediation_will_be_proposed
+        else
+          echo "--- NOT PROTECTED: $TOP_BASENAME is eligible to be killed ---"
+          echo "Top_process_not_protected:${TOP_BASENAME} PID:${TOP_PID} METRIC:${TOP_MEM}%"
+        fi
+        echo '[/STAGE 1]'
+      register: diagnose_result
+
+    - name: "STAGE 1 - Show diagnosis output"
+      tags: [diagnose]
+      debug:
+        var: diagnose_result.stdout_lines
+
+    - name: "STAGE 1 - Flag whether the top process is protected"
+      tags: [diagnose]
+      set_fact:
+        top_process_protected: "{{ 'PROTECTED_PROCESS_FOUND' in diagnose_result.stdout }}"
+
+    - name: "STAGE 1 - Publish result for the workflow/orchestrator"
+      tags: [diagnose]
+      set_stats:
+        data:
+          top_process_protected: "{{ top_process_protected }}"
+
+    # ── Stage 2: CLEAR TEMP FILES (tags: remediate) ─────────────────────
+    - name: "STAGE 2 - Clear temp files"
+      tags: [remediate]
+      shell: |
+        set -o pipefail
+        echo '[STAGE 2 - CLEAR TEMP]'
+        BEFORE=$(free -m | awk '/Mem/{print $7}')
+        rm -rf /tmp/* /var/tmp/* 2>/dev/null || true
+        find /dev/shm -type f -mmin +10 -delete 2>/dev/null || true
+        ipcs -m 2>/dev/null | awk 'NR>3 && $6==0{print $2}' | while read id; do ipcrm -m $id 2>/dev/null; done || true
+        AFTER=$(free -m | awk '/Mem/{print $7}')
+        echo Freed:$(( AFTER - BEFORE ))MB
+        free -h
+        echo '[/STAGE 2]'
+      register: clear_temp_result
+
+    - name: "STAGE 2 - Show output"
+      tags: [remediate]
+      debug:
+        var: clear_temp_result.stdout_lines
+
+    # ── Stage 3: DROP CACHES (tags: remediate) ──────────────────────────
+    - name: "STAGE 3 - Drop kernel caches"
+      tags: [remediate]
+      shell: |
+        set -o pipefail
+        echo '[STAGE 3 - DROP CACHES]'
+        BEFORE=$(free -m | awk '/Mem/{print $7}')
+        sync && echo 3 > /proc/sys/vm/drop_caches
+        echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
+        AFTER=$(free -m | awk '/Mem/{print $7}')
+        echo Freed:$(( AFTER - BEFORE ))MB
+        free -h
+        echo '[/STAGE 3]'
+      register: drop_caches_result
+
+    - name: "STAGE 3 - Show output"
+      tags: [remediate]
+      debug:
+        var: drop_caches_result.stdout_lines
+
+    # ── Stage 4: KILL IF STILL CRITICAL (tags: remediate) ───────────────
+    - name: "STAGE 4 - Kill a non-protected process only if still critical"
+      tags: [remediate]
+      shell: |
+        set -o pipefail
+        echo '[STAGE 4 - KILL IF CRITICAL]'
+        PROTECTED='{{ protected_processes | join(" ") }}'
+        FREE_PCT=$(awk '/MemAvailable/{a=$2} /MemTotal/{t=$2} END{print int(a*100/t)}' /proc/meminfo)
+        echo "Available:${FREE_PCT}%"
+        if [ ${FREE_PCT:-20} -lt 15 ]; then
+          KILLED=false
+          ps aux --sort=-%mem --no-headers | awk '{print $2,$11}' | head -10 | while read PID CMD; do
+            BASENAME=$(basename $CMD 2>/dev/null || echo $CMD)
+            IS_PROTECTED=false
+            for P in $PROTECTED; do
+              echo $BASENAME | grep -qi $P && IS_PROTECTED=true && break
+            done
+            if [ $IS_PROTECTED = true ]; then
+              echo "Skipped_protected:$BASENAME PID:$PID"
+              continue
+            fi
+            echo "Must_kill:$BASENAME PID:$PID"
+            kill -15 $PID 2>/dev/null
+            sleep 5
+            ps -p $PID > /dev/null 2>&1 && kill -9 $PID 2>/dev/null
+            KILLED=true
+            break
+          done
+          [ "$KILLED" = false ] && echo No_non_protected_high_mem_process_found || true
+        else
+          echo Cleanup_sufficient_no_kill_needed
+        fi
+        free -h
+        echo "$(date '+%Y-%m-%d %H:%M:%S IST') [HEALED memory_pressure] $(hostname)" >> {{ heal_log_path }}
+        echo '[/STAGE 4]'
+      register: kill_if_critical_result
+
+    - name: "STAGE 4 - Show output"
+      tags: [remediate]
+      debug:
+        var: kill_if_critical_result.stdout_lines

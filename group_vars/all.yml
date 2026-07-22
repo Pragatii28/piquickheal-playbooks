@@ -1,0 +1,20 @@
+---
+# Equivalent to the Python `_PROTECTED` string in playbooks.py.
+# Referenced by every playbook as {{ protected_processes | join(' ') }}
+protected_processes:
+  - ollama
+  - postgres
+  - mysqld
+  - redis-server
+  - redis
+  - nginx
+  - apache2
+  - mongod
+  - sshd
+  - systemd
+  - dockerd
+  - containerd
+  - java
+  - node
+
+heal_log_path: /var/log/auto-healer.log
