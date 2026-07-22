@@ -13,6 +13,7 @@
   hosts: all
 
   vars:
+
     # CPU recovery threshold
     cpu_recover_threshold: 15
 
@@ -45,66 +46,152 @@
     - name: "STAGE 1 - Diagnose top CPU consumer"
       tags:
         - diagnose
+
       changed_when: false
+
       shell: |
         set -o pipefail
 
-        echo '[STAGE 1 - DIAGNOSIS]'
+        echo "============================================================"
+        echo "        PIQUICKHEAL - CPU SPIKE DIAGNOSIS"
+        echo "============================================================"
+
+        echo ""
+        echo "[1] SYSTEM UPTIME AND LOAD"
+        echo "------------------------------------------------------------"
 
         uptime
 
-        echo 'Top CPU processes:'
+        echo ""
+        echo "[2] TOP CPU-CONSUMING PROCESSES"
+        echo "------------------------------------------------------------"
+
         ps aux --sort=-%cpu | head -11
 
-        TOP_PID=$(ps aux --sort=-%cpu --no-headers | awk 'NR==1{print $2}')
-        TOP_CMD=$(ps aux --sort=-%cpu --no-headers | awk 'NR==1{print $11}')
-        TOP_CPU=$(ps aux --sort=-%cpu --no-headers | awk 'NR==1{print $3}')
+        echo ""
+        echo "[3] TOP CPU CONSUMER DETAILS"
+        echo "------------------------------------------------------------"
 
-        TOP_NAME=$(basename "$TOP_CMD" 2>/dev/null || echo "$TOP_CMD")
+        TOP_LINE=$(ps aux --sort=-%cpu --no-headers | head -1)
+
+        if [ -z "$TOP_LINE" ]; then
+
+          echo "ERROR: Unable to identify top CPU-consuming process"
+
+          exit 1
+
+        fi
+
+        TOP_PID=$(echo "$TOP_LINE" | awk '{print $2}')
+        TOP_CPU=$(echo "$TOP_LINE" | awk '{print $3}')
+        TOP_MEM=$(echo "$TOP_LINE" | awk '{print $4}')
+
+        TOP_CMD=$(echo "$TOP_LINE" | awk '{for(i=11;i<=NF;i++) printf "%s ", $i}')
+
+        TOP_NAME=$(echo "$TOP_LINE" | awk '{print $11}' | xargs -r basename)
+
+        echo "Process Name : $TOP_NAME"
+        echo "PID          : $TOP_PID"
+        echo "CPU Usage    : ${TOP_CPU}%"
+        echo "Memory Usage : ${TOP_MEM}%"
+        echo "Command      : $TOP_CMD"
+
+        echo ""
+        echo "[4] PROTECTED PROCESS CHECK"
+        echo "------------------------------------------------------------"
 
         PROTECTED='{{ protected_processes | join(" ") }}'
 
+        echo "Protected Process List:"
+        echo "$PROTECTED"
+
         IS_PROT=false
+        PROTECTED_MATCH=""
 
         for P in $PROTECTED; do
-          echo "$TOP_NAME" | grep -qi "$P" && IS_PROT=true && break
+
+          if echo "$TOP_NAME" | grep -qi "^${P}$"; then
+
+            IS_PROT=true
+            PROTECTED_MATCH="$P"
+
+            break
+
+          fi
+
         done
 
         if [ "$IS_PROT" = true ]; then
 
           TOTAL=$(pgrep -xc "$TOP_NAME" 2>/dev/null || echo 0)
 
-          echo "PROTECTED_PROCESS_FOUND:${TOP_NAME} PID:${TOP_PID} METRIC:${TOP_CPU}% TOTAL_INSTANCES:${TOTAL}"
+          echo ""
+          echo "============================================================"
+          echo "RESULT: PROTECTED PROCESS"
+          echo "============================================================"
+
+          echo "Protected Name : $PROTECTED_MATCH"
+          echo "PID            : $TOP_PID"
+          echo "CPU Usage      : ${TOP_CPU}%"
+          echo "Memory Usage   : ${TOP_MEM}%"
+          echo "Total Instances: $TOTAL"
+          echo "ACTION         : NO AUTOMATIC REMEDIATION"
+
+          echo ""
+          echo "Protected Process Instances:"
+          echo "------------------------------------------------------------"
 
           for IPID in $(pgrep -x "$TOP_NAME" 2>/dev/null); do
 
             ISTATS=$(ps -p "$IPID" -o pcpu=,pmem= 2>/dev/null)
 
-            [ -z "$ISTATS" ] && continue
+            if [ -n "$ISTATS" ]; then
 
-            ICPU=$(echo "$ISTATS" | awk '{print $1}')
-            IMEM=$(echo "$ISTATS" | awk '{print $2}')
+              ICPU=$(echo "$ISTATS" | awk '{print $1}')
+              IMEM=$(echo "$ISTATS" | awk '{print $2}')
 
-            echo "PROTECTED_INSTANCE:${TOP_NAME} PID:${IPID} CPU:${ICPU}% MEM:${IMEM}%"
+              echo "PID: $IPID | CPU: ${ICPU}% | MEM: ${IMEM}%"
+
+            fi
 
           done
+
+          echo ""
+          echo "PROTECTED_PROCESS_FOUND:${TOP_NAME} PID:${TOP_PID} METRIC:${TOP_CPU}%"
 
           echo "Top_process_is_protected_no_remediation_will_be_proposed"
 
         else
 
+          echo ""
+          echo "============================================================"
+          echo "RESULT: NON-PROTECTED PROCESS"
+          echo "============================================================"
+
+          echo "Process Name : $TOP_NAME"
+          echo "PID          : $TOP_PID"
+          echo "CPU Usage    : ${TOP_CPU}%"
+          echo "Memory Usage : ${TOP_MEM}%"
+          echo "Command      : $TOP_CMD"
+          echo "ACTION       : REMEDIATION MAY BE PROPOSED"
+
+          echo ""
           echo "Top_process_not_protected:${TOP_NAME} PID:${TOP_PID} METRIC:${TOP_CPU}%"
 
         fi
 
-        echo '[/STAGE 1]'
+        echo ""
+        echo "============================================================"
+        echo "        END OF CPU SPIKE DIAGNOSIS"
+        echo "============================================================"
 
       register: diagnose_result
 
 
-    - name: "STAGE 1 - Show diagnosis output"
+    - name: "STAGE 1 - Show complete diagnosis output"
       tags:
         - diagnose
+
       debug:
         var: diagnose_result.stdout_lines
 
@@ -112,6 +199,7 @@
     - name: "STAGE 1 - Flag whether the top process is protected"
       tags:
         - diagnose
+
       set_fact:
         top_process_protected: >-
           {{ 'PROTECTED_PROCESS_FOUND' in diagnose_result.stdout }}
@@ -120,6 +208,7 @@
     - name: "STAGE 1 - Publish result for the workflow/orchestrator"
       tags:
         - diagnose
+
       set_stats:
         data:
           top_process_protected: "{{ top_process_protected }}"
@@ -138,56 +227,92 @@
     - name: "STAGE 2 - Kill top CPU consumer"
       tags:
         - remediate
+
       when:
         - not (top_process_protected | default(false) | bool)
 
       shell: |
         set -o pipefail
 
-        echo '[STAGE 2 - KILL]'
+        echo "============================================================"
+        echo "        PIQUICKHEAL - CPU SPIKE REMEDIATION"
+        echo "============================================================"
 
-        TOP_PID=$(ps aux --sort=-%cpu --no-headers | awk 'NR==1{print $2}')
-        TOP_CMD=$(ps aux --sort=-%cpu --no-headers | awk 'NR==1{print $11}')
-        TOP_CPU=$(ps aux --sort=-%cpu --no-headers | awk 'NR==1{print $3}')
+        echo ""
+        echo "[1] IDENTIFYING CURRENT TOP CPU PROCESS"
+        echo "------------------------------------------------------------"
 
-        TOP_NAME=$(basename "$TOP_CMD" 2>/dev/null || echo "$TOP_CMD")
+        TOP_LINE=$(ps aux --sort=-%cpu --no-headers | head -1)
 
-        echo "Target: $TOP_NAME (PID $TOP_PID) using ${TOP_CPU}% CPU"
+        if [ -z "$TOP_LINE" ]; then
+
+          echo "ERROR: Unable to identify top CPU-consuming process"
+
+          exit 1
+
+        fi
+
+        TOP_PID=$(echo "$TOP_LINE" | awk '{print $2}')
+        TOP_CPU=$(echo "$TOP_LINE" | awk '{print $3}')
+
+        TOP_CMD=$(echo "$TOP_LINE" | awk '{for(i=11;i<=NF;i++) printf "%s ", $i}')
+
+        TOP_NAME=$(echo "$TOP_LINE" | awk '{print $11}' | xargs -r basename)
+
+        echo "Target Process : $TOP_NAME"
+        echo "Target PID     : $TOP_PID"
+        echo "CPU Usage      : ${TOP_CPU}%"
+        echo "Command        : $TOP_CMD"
+
+        echo ""
+        echo "[2] REMEDIATION ACTION"
+        echo "------------------------------------------------------------"
 
         echo "Sending SIGKILL to all $TOP_NAME processes..."
 
         pkill -9 -x "$TOP_NAME" 2>/dev/null \
-          && echo "pkill -9 $TOP_NAME: done" \
-          || echo "pkill: no match (may already be gone)"
+          && echo "pkill -9 $TOP_NAME: SUCCESS" \
+          || echo "pkill: no match (process may already be gone)"
 
         kill -9 "$TOP_PID" 2>/dev/null \
-          && echo "kill -9 PID $TOP_PID: done" \
+          && echo "kill -9 PID $TOP_PID: SUCCESS" \
           || echo "PID $TOP_PID already gone"
 
         PGID=$(ps -p "$TOP_PID" -o pgid= 2>/dev/null | tr -d ' ')
 
         if [ -n "$PGID" ] && [ "$PGID" -gt 1 ]; then
+
           kill -9 "-$PGID" 2>/dev/null \
-            && echo "kill -9 PGID $PGID: done" \
+            && echo "kill -9 PGID $PGID: SUCCESS" \
             || true
+
         fi
 
         sleep 1
+
+        echo ""
+        echo "[3] POST-REMEDIATION PROCESS CHECK"
+        echo "------------------------------------------------------------"
 
         REMAINING=$(pgrep -xc "$TOP_NAME" 2>/dev/null || echo 0)
 
         echo "Remaining $TOP_NAME processes: $REMAINING"
 
-        echo '[/STAGE 2]'
+        echo ""
+        echo "============================================================"
+        echo "        END OF CPU SPIKE REMEDIATION"
+        echo "============================================================"
 
       register: kill_result
 
 
-    - name: "STAGE 2 - Show kill output"
+    - name: "STAGE 2 - Show remediation output"
       tags:
         - remediate
+
       debug:
         var: kill_result.stdout_lines
+
       when:
         - not (top_process_protected | default(false) | bool)
 
@@ -200,6 +325,7 @@
     - name: "STAGE 3 - Poll CPU until it recovers"
       tags:
         - validate
+
       when:
         - not (top_process_protected | default(false) | bool)
 
@@ -222,6 +348,7 @@
     - name: "STAGE 3 - Record heal result to the same log file the Python version used"
       tags:
         - validate
+
       when:
         - not (top_process_protected | default(false) | bool)
 
@@ -234,6 +361,7 @@
     - name: "STAGE 3 - Report outcome"
       tags:
         - validate
+
       when:
         - not (top_process_protected | default(false) | bool)
 
