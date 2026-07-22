@@ -8,6 +8,20 @@
 #
 # Run against a single host by passing -l <hostname>
 # AWX: "limit" field
+#
+# NOTE on how the top CPU consumer is identified (Stage 1 and Stage 2):
+# `ps aux --sort=-%cpu` computes %CPU as CPU-time-used / process-lifetime —
+# a lifetime average, not an instantaneous rate. A process that has existed
+# for only a few milliseconds (like `ps` itself, or anything AWX/Ansible
+# just forked) can show a wildly inflated %CPU purely from that ratio,
+# which is how a near-idle `ps` process was previously reported at "200%".
+# Both stages now sample `top -bn2 -d 1` (two batches, 1s apart) and read
+# the SECOND batch top row: top second batch reflects actual CPU time
+# consumed during that 1-second window, not since process start, so it
+# is not fooled by young/short-lived processes the way a single ps
+# snapshot is. Columns are located by name from top own header line
+# rather than hardcoded positions, since exact column layout can vary
+# slightly by procps version/distro.
 
 - name: PiQuickHeal - cpu_spike
   hosts: all
@@ -61,18 +75,23 @@
         uptime
 
         echo ""
-        echo "[2] TOP CPU-CONSUMING PROCESSES"
+        echo "[2] TOP CPU-CONSUMING PROCESSES (2nd sample, 1s window)"
         echo "------------------------------------------------------------"
 
-        ps aux --sort=-%cpu | head -11 || true
+        # top FIRST batch is still a lifetime average (same issue as ps);
+        # only the batch AFTER it reflects real usage over the 1s window.
+        TOP_BLOCK=$(top -bn2 -d 1)
+
+        echo "$TOP_BLOCK" | awk '/^ *PID/{c++} c==2{print; n=0; next} c==2 && n<10 {print; n++}'
 
         echo ""
         echo "[3] TOP CPU CONSUMER DETAILS"
         echo "------------------------------------------------------------"
 
-        TOP_LINE=$(ps aux --sort=-%cpu --no-headers | head -1 || true)
+        HEADER_LINE=$(echo "$TOP_BLOCK" | awk '/^ *PID/{c++} c==2{print; exit}')
+        DATA_LINE=$(echo "$TOP_BLOCK" | awk '/^ *PID/{c++} c==2 && !/^ *PID/ && NF>0{print; exit}')
 
-        if [ -z "$TOP_LINE" ]; then
+        if [ -z "$DATA_LINE" ]; then
 
           echo "ERROR: Unable to identify top CPU-consuming process"
 
@@ -80,13 +99,20 @@
 
         fi
 
-        TOP_PID=$(echo "$TOP_LINE" | awk '{print $2}')
-        TOP_CPU=$(echo "$TOP_LINE" | awk '{print $3}')
-        TOP_MEM=$(echo "$TOP_LINE" | awk '{print $4}')
+        PID_COL=$(echo "$HEADER_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="PID") print i}')
+        CPU_COL=$(echo "$HEADER_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="%CPU") print i}')
+        MEM_COL=$(echo "$HEADER_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="%MEM") print i}')
+        CMD_COL=$(echo "$HEADER_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="COMMAND") print i}')
 
-        TOP_CMD=$(echo "$TOP_LINE" | awk '{for(i=11;i<=NF;i++) printf "%s ", $i}')
+        TOP_PID=$(echo "$DATA_LINE" | awk -v c="$PID_COL" '{print $c}')
+        TOP_CPU=$(echo "$DATA_LINE" | awk -v c="$CPU_COL" '{print $c}')
+        TOP_MEM=$(echo "$DATA_LINE" | awk -v c="$MEM_COL" '{print $c}')
+        TOP_NAME=$(echo "$DATA_LINE" | awk -v c="$CMD_COL" '{print $c}')
 
-        TOP_NAME=$(echo "$TOP_LINE" | awk '{print $11}' | xargs -r basename)
+        # top truncates COMMAND to fit the terminal width and does not show
+        # full args by default (no -c) — good enough for identification;
+        # full argv is not needed for the protected-process name match below.
+        TOP_CMD="$TOP_NAME"
 
         echo "Process Name : $TOP_NAME"
         echo "PID          : $TOP_PID"
@@ -108,7 +134,7 @@
 
         for P in $PROTECTED; do
 
-          if echo "$TOP_NAME" | grep -qi "^${P}$"; then
+          if echo "$TOP_NAME" | grep -qi "^${P}"; then
 
             IS_PROT=true
             PROTECTED_MATCH="$P"
@@ -210,6 +236,7 @@
       set_stats:
         data:
           top_process_protected: "{{ top_process_protected }}"
+          diagnostic_output: "{{ diagnose_result.stdout }}"
 
 
     # ─────────────────────────────────────────────────────────────────────
@@ -235,12 +262,18 @@
         echo "============================================================"
 
         echo ""
-        echo "[1] IDENTIFYING CURRENT TOP CPU PROCESS"
+        echo "[1] IDENTIFYING CURRENT TOP CPU PROCESS (2nd sample, 1s window)"
         echo "------------------------------------------------------------"
 
-        TOP_LINE=$(ps aux --sort=-%cpu --no-headers | head -1 || true)
+        # Re-sampled fresh here (approval may have taken a while, so the
+        # situation could have changed) — same 2-batch top method as Stage 1,
+        # not the single ps snapshot the earlier version used.
+        TOP_BLOCK=$(top -bn2 -d 1)
 
-        if [ -z "$TOP_LINE" ]; then
+        HEADER_LINE=$(echo "$TOP_BLOCK" | awk '/^ *PID/{c++} c==2{print; exit}')
+        DATA_LINE=$(echo "$TOP_BLOCK" | awk '/^ *PID/{c++} c==2 && !/^ *PID/ && NF>0{print; exit}')
+
+        if [ -z "$DATA_LINE" ]; then
 
           echo "ERROR: Unable to identify top CPU-consuming process"
 
@@ -248,12 +281,14 @@
 
         fi
 
-        TOP_PID=$(echo "$TOP_LINE" | awk '{print $2}')
-        TOP_CPU=$(echo "$TOP_LINE" | awk '{print $3}')
+        PID_COL=$(echo "$HEADER_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="PID") print i}')
+        CPU_COL=$(echo "$HEADER_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="%CPU") print i}')
+        CMD_COL=$(echo "$HEADER_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="COMMAND") print i}')
 
-        TOP_CMD=$(echo "$TOP_LINE" | awk '{for(i=11;i<=NF;i++) printf "%s ", $i}')
-
-        TOP_NAME=$(echo "$TOP_LINE" | awk '{print $11}' | xargs -r basename)
+        TOP_PID=$(echo "$DATA_LINE" | awk -v c="$PID_COL" '{print $c}')
+        TOP_CPU=$(echo "$DATA_LINE" | awk -v c="$CPU_COL" '{print $c}')
+        TOP_NAME=$(echo "$DATA_LINE" | awk -v c="$CMD_COL" '{print $c}')
+        TOP_CMD="$TOP_NAME"
 
         echo "Target Process : $TOP_NAME"
         echo "Target PID     : $TOP_PID"
@@ -311,6 +346,18 @@
 
       when:
         - not (top_process_protected | default(false) | bool)
+
+
+    - name: "STAGE 2 - Publish remediation output for the orchestrator"
+      tags:
+        - remediate
+
+      when:
+        - not (top_process_protected | default(false) | bool)
+
+      set_stats:
+        data:
+          remediation_output: "{{ kill_result.stdout }}"
 
 
     # ─────────────────────────────────────────────────────────────────────
