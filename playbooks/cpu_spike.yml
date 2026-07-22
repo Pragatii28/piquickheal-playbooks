@@ -50,8 +50,6 @@
       changed_when: false
 
       shell: |
-        set -o pipefail
-
         echo "============================================================"
         echo "        PIQUICKHEAL - CPU SPIKE DIAGNOSIS"
         echo "============================================================"
@@ -66,13 +64,13 @@
         echo "[2] TOP CPU-CONSUMING PROCESSES"
         echo "------------------------------------------------------------"
 
-        ps aux --sort=-%cpu | head -11
+        ps aux --sort=-%cpu | head -11 || true
 
         echo ""
         echo "[3] TOP CPU CONSUMER DETAILS"
         echo "------------------------------------------------------------"
 
-        TOP_LINE=$(ps aux --sort=-%cpu --no-headers | head -1)
+        TOP_LINE=$(ps aux --sort=-%cpu --no-headers | head -1 || true)
 
         if [ -z "$TOP_LINE" ]; then
 
@@ -232,8 +230,6 @@
         - not (top_process_protected | default(false) | bool)
 
       shell: |
-        set -o pipefail
-
         echo "============================================================"
         echo "        PIQUICKHEAL - CPU SPIKE REMEDIATION"
         echo "============================================================"
@@ -242,7 +238,7 @@
         echo "[1] IDENTIFYING CURRENT TOP CPU PROCESS"
         echo "------------------------------------------------------------"
 
-        TOP_LINE=$(ps aux --sort=-%cpu --no-headers | head -1)
+        TOP_LINE=$(ps aux --sort=-%cpu --no-headers | head -1 || true)
 
         if [ -z "$TOP_LINE" ]; then
 
@@ -330,8 +326,17 @@
         - not (top_process_protected | default(false) | bool)
 
       shell: |
-        top -bn1 | grep -i 'cpu' | head -1 | \
-          awk '{for(i=1;i<=NF;i++) if($i~/^[0-9]/ && $(i+1)~/id/) print 100-$i}'
+        CPU_USAGE=$(top -bn1 | awk -F',' '/Cpu\(s\)/ {
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /id/) {
+              gsub(/[^0-9.]/, "", $i)
+              print 100 - $i
+              exit
+            }
+          }
+        }')
+
+        echo "${CPU_USAGE:-100}"
 
       register: cpu_check
 
