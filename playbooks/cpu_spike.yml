@@ -75,14 +75,24 @@
         uptime
 
         echo ""
-        echo "[2] TOP CPU-CONSUMING PROCESSES (2nd sample, 1s window)"
+        echo "[2] TOP 10 CPU-CONSUMING PROCESSES (2nd sample, 1s window)"
         echo "------------------------------------------------------------"
 
         # top FIRST batch is still a lifetime average (same issue as ps);
         # only the batch AFTER it reflects real usage over the 1s window.
         TOP_BLOCK=$(top -bn2 -d 1)
 
-        echo "$TOP_BLOCK" | awk '/^ *PID/{c++} c==2{print; n=0; next} c==2 && n<10 {print; n++}'
+        # Print the 2nd batch's header line, then only the next 10 data
+        # lines after it. NOTE: the header-match and the counter reset
+        # must live in the SAME pattern/action pair (matched only on the
+        # header line itself) — putting the reset in its own unconditional
+        # `c==2{...}` rule matches every line once c reaches 2, not just
+        # the header, which silently defeats the n<10 cap and dumps the
+        # entire process table.
+        echo "$TOP_BLOCK" | awk '
+          /^ *PID/ { c++; if (c==2) { print; n=0 }; next }
+          c==2 && n<10 { print; n++ }
+        '
 
         echo ""
         echo "[3] TOP CPU CONSUMER DETAILS"
