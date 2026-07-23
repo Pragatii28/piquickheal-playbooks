@@ -1,31 +1,29 @@
 ---
-# Equivalent of PLAYBOOKS["cpu_spike"] from playbooks.py.
+# PiQuickHeal - CPU Spike Diagnosis and Remediation
 #
-# AWX wiring:
-#   Job Template A: "piquickheal-cpu_spike-diagnose"  -> tags: diagnose
-#   Job Template B: "piquickheal-cpu_spike-remediate" -> tags: remediate,validate
-#   Workflow Template: A -> [Approval] -> B
+# AWX Job Templates:
 #
-# Run against a single host by passing -l <hostname>
-# AWX: "limit" field
+# 1. piquickheal-cpu_spike-diagnose
+#    Tags: diagnose
 #
-# NOTE on how the top CPU consumer is identified (Stage 1 and Stage 2):
-# `ps aux --sort=-%cpu` computes %CPU as CPU-time-used / process-lifetime —
-# a lifetime average, not an instantaneous rate. A process that has existed
-# for only a few milliseconds (like `ps` itself, or anything AWX/Ansible
-# just forked) can show a wildly inflated %CPU purely from that ratio,
-# which is how a near-idle `ps` process was previously reported at "200%".
-# Both stages now sample `top -bn2 -d 1` (two batches, 1s apart) and read
-# the SECOND batch top row: top second batch reflects actual CPU time
-# consumed during that 1-second window, not since process start, so it
-# is not fooled by young/short-lived processes the way a single ps
-# snapshot is. Columns are located by name from top own header line
-# rather than hardcoded positions, since exact column layout can vary
-# slightly by procps version/distro.
+# 2. piquickheal-cpu_spike-remediate
+#    Tags: remediate,validate
+#
+# Workflow:
+#
+# Diagnose → Approval → Remediate → Validate
+#
+# Run against a single host:
+# ansible-playbook cpu_spike.yml -l hostname
+#
+# AWX:
+# Use the Limit field to select a specific host.
 
-- name: PiQuickHeal - cpu_spike
+- name: PiQuickHeal - CPU Spike
   hosts: all
   become: true
+  gather_facts: true
+
   vars:
 
     # CPU recovery threshold
@@ -50,20 +48,17 @@
     # Heal log file
     heal_log_path: /var/log/piquickheal/heal.log
 
+
   tasks:
 
-    # ─────────────────────────────────────────────────────────────────────
+    # ============================================================
     # STAGE 1: DIAGNOSE
-    # Tags: diagnose
-    # ─────────────────────────────────────────────────────────────────────
+    # ============================================================
 
     - name: "STAGE 1 - Diagnose top CPU consumer"
-      tags:
-        - diagnose
+      ansible.builtin.shell: |
+        set -o pipefail
 
-      changed_when: false
-
-      shell: |
         echo "============================================================"
         echo "        PIQUICKHEAL - CPU SPIKE DIAGNOSIS"
         echo "============================================================"
@@ -75,60 +70,111 @@
         uptime
 
         echo ""
-        echo "[2] TOP 10 CPU-CONSUMING PROCESSES (2nd sample, 1s window)"
+        echo "[2] TOP 10 CPU-CONSUMING PROCESSES"
         echo "------------------------------------------------------------"
 
-        # top FIRST batch is still a lifetime average (same issue as ps);
-        # only the batch AFTER it reflects real usage over the 1s window.
+        # Run top twice with a 1-second interval.
+        # The second sample gives a more realistic CPU usage value.
         TOP_BLOCK=$(top -bn2 -d 1)
 
-        # Print the 2nd batch's header line, then only the next 10 data
-        # lines after it. NOTE: the header-match and the counter reset
-        # must live in the SAME pattern/action pair (matched only on the
-        # header line itself) — putting the reset in its own unconditional
-        # `c==2{...}` rule matches every line once c reaches 2, not just
-        # the header, which silently defeats the n<10 cap and dumps the
-        # entire process table.
         echo "$TOP_BLOCK" | awk '
-          /^ *PID/ { c++; if (c==2) { print; n=0 }; next }
-          c==2 && n<10 { print; n++ }
+          /^ *PID/ {
+              c++
+              if (c == 2) {
+                  print
+                  n=0
+              }
+              next
+          }
+
+          c == 2 && n < 10 {
+              print
+              n++
+          }
         '
 
         echo ""
         echo "[3] TOP CPU CONSUMER DETAILS"
         echo "------------------------------------------------------------"
 
-        HEADER_LINE=$(echo "$TOP_BLOCK" | awk '/^ *PID/{c++} c==2{print; exit}')
-        DATA_LINE=$(echo "$TOP_BLOCK" | awk '/^ *PID/{c++} c==2 && !/^ *PID/ && NF>0{print; exit}')
+        HEADER_LINE=$(echo "$TOP_BLOCK" | awk '
+          /^ *PID/ {
+              c++
+          }
+
+          c == 2 {
+              print
+              exit
+          }
+        ')
+
+        DATA_LINE=$(echo "$TOP_BLOCK" | awk '
+          /^ *PID/ {
+              c++
+              next
+          }
+
+          c == 2 && NF > 0 {
+              print
+              exit
+          }
+        ')
 
         if [ -z "$DATA_LINE" ]; then
-
-          echo "ERROR: Unable to identify top CPU-consuming process"
-
-          exit 1
-
+            echo "ERROR: Unable to identify top CPU-consuming process"
+            exit 1
         fi
 
-        PID_COL=$(echo "$HEADER_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="PID") print i}')
-        CPU_COL=$(echo "$HEADER_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="%CPU") print i}')
-        MEM_COL=$(echo "$HEADER_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="%MEM") print i}')
-        CMD_COL=$(echo "$HEADER_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="COMMAND") print i}')
+        PID_COL=$(echo "$HEADER_LINE" | awk '
+          {
+              for (i=1; i<=NF; i++) {
+                  if ($i == "PID") {
+                      print i
+                  }
+              }
+          }
+        ')
+
+        CPU_COL=$(echo "$HEADER_LINE" | awk '
+          {
+              for (i=1; i<=NF; i++) {
+                  if ($i == "%CPU") {
+                      print i
+                  }
+              }
+          }
+        ')
+
+        MEM_COL=$(echo "$HEADER_LINE" | awk '
+          {
+              for (i=1; i<=NF; i++) {
+                  if ($i == "%MEM") {
+                      print i
+                  }
+              }
+          }
+        ')
+
+        CMD_COL=$(echo "$HEADER_LINE" | awk '
+          {
+              for (i=1; i<=NF; i++) {
+                  if ($i == "COMMAND") {
+                      print i
+                  }
+              }
+          }
+        ')
 
         TOP_PID=$(echo "$DATA_LINE" | awk -v c="$PID_COL" '{print $c}')
         TOP_CPU=$(echo "$DATA_LINE" | awk -v c="$CPU_COL" '{print $c}')
         TOP_MEM=$(echo "$DATA_LINE" | awk -v c="$MEM_COL" '{print $c}')
         TOP_NAME=$(echo "$DATA_LINE" | awk -v c="$CMD_COL" '{print $c}')
 
-        # top truncates COMMAND to fit the terminal width and does not show
-        # full args by default (no -c) — good enough for identification;
-        # full argv is not needed for the protected-process name match below.
-        TOP_CMD="$TOP_NAME"
-
         echo "Process Name : $TOP_NAME"
         echo "PID          : $TOP_PID"
         echo "CPU Usage    : ${TOP_CPU}%"
         echo "Memory Usage : ${TOP_MEM}%"
-        echo "Command      : $TOP_CMD"
+        echo "Command      : $TOP_NAME"
 
         echo ""
         echo "[4] PROTECTED PROCESS CHECK"
@@ -144,73 +190,70 @@
 
         for P in $PROTECTED; do
 
-          if echo "$TOP_NAME" | grep -qi "^${P}"; then
-
-            IS_PROT=true
-            PROTECTED_MATCH="$P"
-
-            break
-
-          fi
+            if echo "$TOP_NAME" | grep -qi "^${P}$"; then
+                IS_PROT=true
+                PROTECTED_MATCH="$P"
+                break
+            fi
 
         done
 
         if [ "$IS_PROT" = true ]; then
 
-          TOTAL=$(pgrep -xc "$TOP_NAME" 2>/dev/null || echo 0)
+            TOTAL=$(pgrep -xc "$TOP_NAME" 2>/dev/null || echo 0)
 
-          echo ""
-          echo "============================================================"
-          echo "RESULT: PROTECTED PROCESS"
-          echo "============================================================"
+            echo ""
+            echo "============================================================"
+            echo "RESULT: PROTECTED PROCESS"
+            echo "============================================================"
 
-          echo "Protected Name : $PROTECTED_MATCH"
-          echo "PID            : $TOP_PID"
-          echo "CPU Usage      : ${TOP_CPU}%"
-          echo "Memory Usage   : ${TOP_MEM}%"
-          echo "Total Instances: $TOTAL"
-          echo "ACTION         : NO AUTOMATIC REMEDIATION"
+            echo "Protected Name : $PROTECTED_MATCH"
+            echo "PID            : $TOP_PID"
+            echo "CPU Usage      : ${TOP_CPU}%"
+            echo "Memory Usage   : ${TOP_MEM}%"
+            echo "Total Instances: $TOTAL"
+            echo "ACTION         : NO AUTOMATIC REMEDIATION"
 
-          echo ""
-          echo "Protected Process Instances:"
-          echo "------------------------------------------------------------"
+            echo ""
+            echo "Protected Process Instances:"
+            echo "------------------------------------------------------------"
 
-          for IPID in $(pgrep -x "$TOP_NAME" 2>/dev/null); do
+            for IPID in $(pgrep -x "$TOP_NAME" 2>/dev/null); do
 
-            ISTATS=$(ps -p "$IPID" -o pcpu=,pmem= 2>/dev/null)
+                ISTATS=$(ps -p "$IPID" -o pcpu=,pmem= 2>/dev/null)
 
-            if [ -n "$ISTATS" ]; then
+                if [ -n "$ISTATS" ]; then
 
-              ICPU=$(echo "$ISTATS" | awk '{print $1}')
-              IMEM=$(echo "$ISTATS" | awk '{print $2}')
+                    ICPU=$(echo "$ISTATS" | awk '{print $1}')
+                    IMEM=$(echo "$ISTATS" | awk '{print $2}')
 
-              echo "PID: $IPID | CPU: ${ICPU}% | MEM: ${IMEM}%"
+                    echo "PID: $IPID | CPU: ${ICPU}% | MEM: ${IMEM}%"
 
-            fi
+                fi
 
-          done
+            done
 
-          echo ""
-          echo "PROTECTED_PROCESS_FOUND:${TOP_NAME} PID:${TOP_PID} METRIC:${TOP_CPU}%"
+            echo ""
+            echo "PROTECTED_PROCESS_FOUND:${TOP_NAME} PID:${TOP_PID} METRIC:${TOP_CPU}%"
 
-          echo "Top_process_is_protected_no_remediation_will_be_proposed"
+            echo "Top_process_is_protected_no_remediation_will_be_proposed"
 
         else
 
-          echo ""
-          echo "============================================================"
-          echo "RESULT: NON-PROTECTED PROCESS"
-          echo "============================================================"
+            echo ""
+            echo "============================================================"
+            echo "RESULT: NON-PROTECTED PROCESS"
+            echo "============================================================"
 
-          echo "Process Name : $TOP_NAME"
-          echo "PID          : $TOP_PID"
-          echo "CPU Usage    : ${TOP_CPU}%"
-          echo "Memory Usage : ${TOP_MEM}%"
-          echo "Command      : $TOP_CMD"
-          echo "ACTION       : REMEDIATION MAY BE PROPOSED"
+            echo "Process Name : $TOP_NAME"
+            echo "PID          : $TOP_PID"
+            echo "CPU Usage    : ${TOP_CPU}%"
+            echo "Memory Usage : ${TOP_MEM}%"
+            echo "Command      : $TOP_NAME"
+            echo "ACTION       : REMEDIATION MAY BE PROPOSED"
 
-          echo ""
-          echo "Top_process_not_protected:${TOP_NAME} PID:${TOP_PID} METRIC:${TOP_CPU}%"
+            echo ""
+            echo "Top_process_not_protected:${TOP_NAME} PID:${TOP_PID} METRIC:${TOP_CPU}%"
 
         fi
 
@@ -220,124 +263,219 @@
         echo "============================================================"
 
       register: diagnose_result
+      changed_when: false
+      tags:
+        - diagnose
 
+
+    # ============================================================
+    # DISPLAY DIAGNOSIS OUTPUT
+    # ============================================================
 
     - name: "STAGE 1 - Show complete diagnosis output"
+      ansible.builtin.debug:
+        var: diagnose_result.stdout_lines
       tags:
         - diagnose
 
-      debug:
-        var: diagnose_result.stdout_lines
 
+    # ============================================================
+    # IDENTIFY PROTECTED PROCESS
+    # ============================================================
 
     - name: "STAGE 1 - Flag whether the top process is protected"
-      tags:
-        - diagnose
-
-      set_fact:
+      ansible.builtin.set_fact:
         top_process_protected: >-
           {{ 'PROTECTED_PROCESS_FOUND' in diagnose_result.stdout }}
-
-
-    - name: "STAGE 1 - Publish result for the workflow/orchestrator"
       tags:
         - diagnose
 
-      set_stats:
+
+    # ============================================================
+    # PUBLISH DIAGNOSIS RESULT
+    # ============================================================
+
+    - name: "STAGE 1 - Publish diagnosis result"
+      ansible.builtin.set_stats:
         data:
           top_process_protected: "{{ top_process_protected }}"
           diagnostic_output: "{{ diagnose_result.stdout }}"
-
-
-    # ─────────────────────────────────────────────────────────────────────
-    # STAGE 2: KILL
-    # Tags: remediate
-    #
-    # Only runs when:
-    # top_process_protected == false
-    #
-    # In AWX, this stage should be executed after approval.
-    # ─────────────────────────────────────────────────────────────────────
-
-    - name: "STAGE 2 - Kill top CPU consumer"
       tags:
-        - remediate
+        - diagnose
 
-      when:
-        - not (top_process_protected | default(false) | bool)
 
-      shell: |
+    # ============================================================
+    # STAGE 2: REMEDIATION
+    # ============================================================
+
+    - name: "STAGE 2 - Identify current top CPU consumer"
+      ansible.builtin.shell: |
+        set -o pipefail
+
         echo "============================================================"
         echo "        PIQUICKHEAL - CPU SPIKE REMEDIATION"
         echo "============================================================"
 
         echo ""
-        echo "[1] IDENTIFYING CURRENT TOP CPU PROCESS (2nd sample, 1s window)"
+        echo "[1] IDENTIFYING CURRENT TOP CPU PROCESS"
         echo "------------------------------------------------------------"
 
-        # Re-sampled fresh here (approval may have taken a while, so the
-        # situation could have changed) — same 2-batch top method as Stage 1,
-        # not the single ps snapshot the earlier version used.
         TOP_BLOCK=$(top -bn2 -d 1)
 
-        HEADER_LINE=$(echo "$TOP_BLOCK" | awk '/^ *PID/{c++} c==2{print; exit}')
-        DATA_LINE=$(echo "$TOP_BLOCK" | awk '/^ *PID/{c++} c==2 && !/^ *PID/ && NF>0{print; exit}')
+        HEADER_LINE=$(echo "$TOP_BLOCK" | awk '
+          /^ *PID/ {
+              c++
+          }
+
+          c == 2 {
+              print
+              exit
+          }
+        ')
+
+        DATA_LINE=$(echo "$TOP_BLOCK" | awk '
+          /^ *PID/ {
+              c++
+              next
+          }
+
+          c == 2 && NF > 0 {
+              print
+              exit
+          }
+        ')
 
         if [ -z "$DATA_LINE" ]; then
-
-          echo "ERROR: Unable to identify top CPU-consuming process"
-
-          exit 1
-
+            echo "ERROR: Unable to identify top CPU-consuming process"
+            exit 1
         fi
 
-        PID_COL=$(echo "$HEADER_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="PID") print i}')
-        CPU_COL=$(echo "$HEADER_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="%CPU") print i}')
-        CMD_COL=$(echo "$HEADER_LINE" | awk '{for(i=1;i<=NF;i++) if($i=="COMMAND") print i}')
+        PID_COL=$(echo "$HEADER_LINE" | awk '
+          {
+              for (i=1; i<=NF; i++) {
+                  if ($i == "PID") {
+                      print i
+                  }
+              }
+          }
+        ')
+
+        CPU_COL=$(echo "$HEADER_LINE" | awk '
+          {
+              for (i=1; i<=NF; i++) {
+                  if ($i == "%CPU") {
+                      print i
+                  }
+              }
+          }
+        ')
+
+        CMD_COL=$(echo "$HEADER_LINE" | awk '
+          {
+              for (i=1; i<=NF; i++) {
+                  if ($i == "COMMAND") {
+                      print i
+                  }
+              }
+          }
+        ')
 
         TOP_PID=$(echo "$DATA_LINE" | awk -v c="$PID_COL" '{print $c}')
         TOP_CPU=$(echo "$DATA_LINE" | awk -v c="$CPU_COL" '{print $c}')
         TOP_NAME=$(echo "$DATA_LINE" | awk -v c="$CMD_COL" '{print $c}')
-        TOP_CMD="$TOP_NAME"
 
         echo "Target Process : $TOP_NAME"
         echo "Target PID     : $TOP_PID"
         echo "CPU Usage      : ${TOP_CPU}%"
-        echo "Command        : $TOP_CMD"
 
         echo ""
-        echo "[2] REMEDIATION ACTION"
+        echo "[2] PROTECTED PROCESS VALIDATION"
         echo "------------------------------------------------------------"
 
-        echo "Sending SIGKILL to all $TOP_NAME processes..."
+        PROTECTED='{{ protected_processes | join(" ") }}'
 
-        pkill -9 -x "$TOP_NAME" 2>/dev/null \
-          && echo "pkill -9 $TOP_NAME: SUCCESS" \
-          || echo "pkill: no match (process may already be gone)"
+        IS_PROTECTED=false
 
-        kill -9 "$TOP_PID" 2>/dev/null \
-          && echo "kill -9 PID $TOP_PID: SUCCESS" \
-          || echo "PID $TOP_PID already gone"
+        for P in $PROTECTED; do
 
-        PGID=$(ps -p "$TOP_PID" -o pgid= 2>/dev/null | tr -d ' ')
+            if echo "$TOP_NAME" | grep -qi "^${P}$"; then
+                IS_PROTECTED=true
+                break
+            fi
 
-        if [ -n "$PGID" ] && [ "$PGID" -gt 1 ]; then
+        done
 
-          kill -9 "-$PGID" 2>/dev/null \
-            && echo "kill -9 PGID $PGID: SUCCESS" \
-            || true
+        if [ "$IS_PROTECTED" = true ]; then
+
+            echo "============================================================"
+            echo "PROTECTED PROCESS DETECTED"
+            echo "============================================================"
+
+            echo "Process: $TOP_NAME"
+            echo "PID    : $TOP_PID"
+            echo "ACTION : NO REMEDIATION"
+
+            echo "PROTECTED_PROCESS_FOUND:${TOP_NAME} PID:${TOP_PID}"
+
+            exit 10
+
+        fi
+
+        echo ""
+        echo "[3] PROCESS VALIDATION"
+        echo "------------------------------------------------------------"
+
+        if ! kill -0 "$TOP_PID" 2>/dev/null; then
+
+            echo "Process PID $TOP_PID no longer exists."
+            echo "ACTION: NO REMEDIATION REQUIRED"
+
+            exit 0
+
+        fi
+
+        echo "Process PID $TOP_PID is active."
+
+        echo ""
+        echo "[4] REMEDIATION ACTION"
+        echo "------------------------------------------------------------"
+
+        echo "Sending SIGTERM to PID $TOP_PID..."
+
+        kill -15 "$TOP_PID" 2>/dev/null || true
+
+        sleep 3
+
+        if kill -0 "$TOP_PID" 2>/dev/null; then
+
+            echo "Process still running."
+            echo "Sending SIGKILL to PID $TOP_PID..."
+
+            kill -9 "$TOP_PID" 2>/dev/null || true
+
+        else
+
+            echo "Process stopped gracefully."
 
         fi
 
         sleep 1
 
         echo ""
-        echo "[3] POST-REMEDIATION PROCESS CHECK"
+        echo "[5] POST-REMEDIATION CHECK"
         echo "------------------------------------------------------------"
 
-        REMAINING=$(pgrep -xc "$TOP_NAME" 2>/dev/null || echo 0)
+        if kill -0 "$TOP_PID" 2>/dev/null; then
 
-        echo "Remaining $TOP_NAME processes: $REMAINING"
+            echo "PID $TOP_PID is still running."
+            echo "REMEDIATION_STATUS: FAILED"
+
+        else
+
+            echo "PID $TOP_PID is no longer running."
+            echo "REMEDIATION_STATUS: SUCCESS"
+
+        fi
 
         echo ""
         echo "============================================================"
@@ -345,57 +483,69 @@
         echo "============================================================"
 
       register: kill_result
+      changed_when: true
+      when:
+        - not (top_process_protected | default(false) | bool)
+      tags:
+        - remediate
 
+
+    # ============================================================
+    # DISPLAY REMEDIATION OUTPUT
+    # ============================================================
 
     - name: "STAGE 2 - Show remediation output"
-      tags:
-        - remediate
-
-      debug:
+      ansible.builtin.debug:
         var: kill_result.stdout_lines
-
       when:
         - not (top_process_protected | default(false) | bool)
-
-
-    - name: "STAGE 2 - Publish remediation output for the orchestrator"
       tags:
         - remediate
 
-      when:
-        - not (top_process_protected | default(false) | bool)
 
-      set_stats:
+    # ============================================================
+    # PUBLISH REMEDIATION OUTPUT
+    # ============================================================
+
+    - name: "STAGE 2 - Publish remediation output"
+      ansible.builtin.set_stats:
         data:
           remediation_output: "{{ kill_result.stdout }}"
-
-
-    # ─────────────────────────────────────────────────────────────────────
-    # STAGE 3: VALIDATE
-    # Tags: validate
-    # ─────────────────────────────────────────────────────────────────────
-
-    - name: "STAGE 3 - Poll CPU until it recovers"
-      tags:
-        - validate
-
       when:
         - not (top_process_protected | default(false) | bool)
+      tags:
+        - remediate
 
-      shell: |
+
+    # ============================================================
+    # STAGE 3: VALIDATE
+    # ============================================================
+
+    - name: "STAGE 3 - Poll CPU until recovery"
+      ansible.builtin.shell: |
         CPU_USAGE=$(top -bn1 | awk -F',' '/Cpu\(s\)/ {
+
           for (i = 1; i <= NF; i++) {
+
             if ($i ~ /id/) {
+
               gsub(/[^0-9.]/, "", $i)
+
               print 100 - $i
+
               exit
+
             }
+
           }
+
         }')
 
         echo "${CPU_USAGE:-100}"
 
       register: cpu_check
+      changed_when: false
+      failed_when: false
 
       until:
         - (cpu_check.stdout | default('100') | float) < cpu_recover_threshold
@@ -403,35 +553,56 @@
       retries: 6
       delay: 5
 
-      changed_when: false
-      failed_when: false
-
-
-    - name: "STAGE 3 - Record heal result to the same log file the Python version used"
-      tags:
-        - validate
-
       when:
         - not (top_process_protected | default(false) | bool)
 
-      shell: |
+      tags:
+        - validate
+
+
+    # ============================================================
+    # RECORD HEAL RESULT
+    # ============================================================
+
+    - name: "STAGE 3 - Record heal result"
+      ansible.builtin.shell: |
         mkdir -p "$(dirname "{{ heal_log_path }}")"
 
-        echo "$(date '+%Y-%m-%d %H:%M:%S IST') [{{ 'HEALED' if (cpu_check.stdout | default('100') | float) < cpu_recover_threshold else 'HEAL_FAILED' }} cpu_spike] $(hostname)" >> "{{ heal_log_path }}"
+        if [ "{{ (cpu_check.stdout | default('100') | float) < cpu_recover_threshold }}" = "True" ]; then
 
+            STATUS="HEALED"
 
-    - name: "STAGE 3 - Report outcome"
-      tags:
-        - validate
+        else
+
+            STATUS="HEAL_FAILED"
+
+        fi
+
+        echo "$(date '+%Y-%m-%d %H:%M:%S %Z') [$STATUS cpu_spike] $(hostname)" >> "{{ heal_log_path }}"
 
       when:
         - not (top_process_protected | default(false) | bool)
 
-      debug:
+      tags:
+        - validate
+
+
+    # ============================================================
+    # REPORT FINAL RESULT
+    # ============================================================
+
+    - name: "STAGE 3 - Report final outcome"
+      ansible.builtin.debug:
         msg: >-
           {{
-            'HEAL_CONFIRMED_CPU_below_threshold'
+            'HEAL_CONFIRMED_CPU_BELOW_THRESHOLD'
             if (cpu_check.stdout | default('100') | float) < cpu_recover_threshold
             else
-            'HEAL_FAILED_CPU_still_elevated'
+            'HEAL_FAILED_CPU_STILL_ELEVATED'
           }}
+
+      when:
+        - not (top_process_protected | default(false) | bool)
+
+      tags:
+        - validate
