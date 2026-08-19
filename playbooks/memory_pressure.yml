@@ -1,153 +1,577 @@
 ---
-# Equivalent of PLAYBOOKS["memory_pressure"] from playbooks.py.
+# PiQuickHeal - Memory Pressure Diagnosis and Remediation
 #
-# AWX wiring:
-#   Job Template A: "piquickheal-memory_pressure-diagnose" -> tags: diagnose
-#   Job Template B: "piquickheal-memory_pressure-remediate" -> tags: remediate
-#   Workflow Template: A -> [Approval] -> B   (requires_approval: True in the source)
-
-- name: PiQuickHeal - memory_pressure
+# AWX Job Templates (names must match backend/services/ansible_client.py
+# AWX_DIAGNOSTIC_TEMPLATE_MAP / AWX_REMEDIATION_TEMPLATE_MAP exactly):
+#
+# 1. piquickheal-high_memory-diagnose
+#    Job Tags: diagnose
+#
+# 2. piquickheal-high_memory-remediate
+#    Job Tags: remediate,validate
+#
+# Workflow:
+#
+# Diagnose → Approval → Remediate → Validate
+#
+# AWX:
+# Limit is set per-launch by PiQuickHeal's launch_awx_job() as
+# {"limit": hostname} — do not hardcode a static Limit on the Job Template.
+#
+# Example:
+#
+# Limit:
+# ubuntu-patch.us-central1-a.c.project-49091190-d07c-4079-8e2.internal
+ 
+- name: PiQuickHeal - Memory Pressure
   hosts: all
   become: true
-
+  gather_facts: true
+ 
+  vars:
+ 
+    # % memory used, below which the host is considered recovered.
+    mem_recover_threshold: 75
+ 
+    # % memory available, below which Stage 4 will kill a non-protected
+    # process even after cleanup — mirrors the escalation gate the original
+    # memory_pressure.yml used.
+    mem_critical_available_pct: 15
+ 
+    protected_processes:
+      - systemd
+      - init
+      - sshd
+      - ssh
+      - NetworkManager
+      - dbus-daemon
+      - dockerd
+      - containerd
+      - mysqld
+      - postgres
+      - postgresql
+      - nginx
+      - httpd
+      - apache2
+      - mongod
+      - redis-server
+      - redis
+      - java
+      - node
+      - ollama
+ 
+    heal_log_path: /var/log/piquickheal/heal.log
+ 
   tasks:
-
-    # ── Stage 1: DIAGNOSE (tags: diagnose) ──────────────────────────────
+ 
+    # ============================================================
+    # STAGE 1: DIAGNOSE
+    # ============================================================
+ 
     - name: "STAGE 1 - Diagnose top memory consumer"
-      tags: [diagnose]
-      changed_when: false
-      shell: |
+      ansible.builtin.shell: |
         set -o pipefail
-        echo '[STAGE 1 - DIAGNOSIS]'
+ 
+        echo "============================================================"
+        echo "        PIQUICKHEAL - MEMORY PRESSURE DIAGNOSIS"
+        echo "============================================================"
+ 
+        echo ""
+        echo "[1] SYSTEM UPTIME AND MEMORY OVERVIEW"
+        echo "------------------------------------------------------------"
+ 
+        uptime
         free -h
-        echo '--- Top memory processes ---'
-        ps aux --sort=-%mem | head -11
-        df -h | grep -E 'tmpfs|/tmp|/dev/shm'
-        dmesg 2>/dev/null | grep -i 'oom' | tail -3 || echo 'No OOM events'
-        TOP_PID=$(ps aux --sort=-%mem --no-headers | awk 'NR==1{print $2}')
-        TOP_CMD=$(ps aux --sort=-%mem --no-headers | awk 'NR==1{print $11}')
-        TOP_MEM=$(ps aux --sort=-%mem --no-headers | awk 'NR==1{print $4}')
-        TOP_BASENAME=$(basename "$TOP_CMD" 2>/dev/null || echo "$TOP_CMD")
-        echo "--- Top consumer: $TOP_BASENAME (PID $TOP_PID) using ${TOP_MEM}% MEM ---"
-        PROTECTED='{{ protected_processes | join(" ") }}'
-        TOP_IS_PROTECTED=false
-        for P in $PROTECTED; do
-          echo "$TOP_BASENAME" | grep -qi "$P" && TOP_IS_PROTECTED=true && break
-        done
-        if [ "$TOP_IS_PROTECTED" = true ]; then
-          echo "--- PROTECTED: $TOP_BASENAME is on this server's protected-process list ---"
-          TOTAL=$(pgrep -xc "$TOP_BASENAME" 2>/dev/null || echo 0)
-          echo "PROTECTED_PROCESS_FOUND:${TOP_BASENAME} PID:${TOP_PID} METRIC:${TOP_MEM}% TOTAL_INSTANCES:${TOTAL}"
-          for IPID in $(pgrep -x "$TOP_BASENAME" 2>/dev/null); do
-            ISTATS=$(ps -p "$IPID" -o pcpu=,pmem= 2>/dev/null)
-            [ -z "$ISTATS" ] && continue
-            ICPU=$(echo $ISTATS | awk '{print $1}')
-            IMEM=$(echo $ISTATS | awk '{print $2}')
-            echo "PROTECTED_INSTANCE:${TOP_BASENAME} PID:${IPID} CPU:${ICPU}% MEM:${IMEM}%"
-          done
-          echo Top_process_is_protected_no_remediation_will_be_proposed
-        else
-          echo "--- NOT PROTECTED: $TOP_BASENAME is eligible to be killed ---"
-          echo "Top_process_not_protected:${TOP_BASENAME} PID:${TOP_PID} METRIC:${TOP_MEM}%"
+ 
+        echo ""
+        echo "[2] CURRENT MEMORY USAGE"
+        echo "------------------------------------------------------------"
+ 
+        MEM_USAGE=$(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{printf "%.2f", (t-a)*100/t}' /proc/meminfo)
+ 
+        echo "Total Memory Usage: ${MEM_USAGE:-UNKNOWN}%"
+ 
+        echo ""
+        echo "[3] TOP 10 MEMORY-CONSUMING PROCESSES"
+        echo "------------------------------------------------------------"
+ 
+        ps -eo pid=,ppid=,user=,pcpu=,pmem=,comm= --sort=-pmem | head -n 10
+ 
+        echo ""
+        echo "[4] TOP MEMORY CONSUMER DETAILS"
+        echo "------------------------------------------------------------"
+ 
+        TOP_LINE=$(ps -eo pid=,ppid=,user=,pcpu=,pmem=,comm= --sort=-pmem | head -n 1)
+ 
+        if [ -z "$TOP_LINE" ]; then
+          echo "ERROR: Unable to identify top memory-consuming process"
+          exit 1
         fi
-        echo '[/STAGE 1]'
+ 
+        TOP_PID=$(echo "$TOP_LINE" | awk '{print $1}')
+        TOP_PPID=$(echo "$TOP_LINE" | awk '{print $2}')
+        TOP_USER=$(echo "$TOP_LINE" | awk '{print $3}')
+        TOP_CPU=$(echo "$TOP_LINE" | awk '{print $4}')
+        TOP_MEM=$(echo "$TOP_LINE" | awk '{print $5}')
+        TOP_NAME=$(echo "$TOP_LINE" | awk '{print $6}')
+ 
+        echo "Process Name : $TOP_NAME"
+        echo "PID          : $TOP_PID"
+        echo "Parent PID   : $TOP_PPID"
+        echo "User         : $TOP_USER"
+        echo "CPU Usage    : ${TOP_CPU}%"
+        echo "Memory Usage : ${TOP_MEM}%"
+ 
+        echo ""
+        echo "[5] TEMP / SHARED-MEMORY FOOTPRINT"
+        echo "------------------------------------------------------------"
+ 
+        df -h | grep -E 'tmpfs|/tmp|/dev/shm' || echo "No tmpfs/shm mounts found"
+ 
+        echo ""
+        echo "[6] RECENT OOM-KILLER EVENTS"
+        echo "------------------------------------------------------------"
+ 
+        dmesg 2>/dev/null | grep -i 'oom' | tail -3 || echo "No OOM events"
+ 
+        echo ""
+        echo "[7] PROTECTED PROCESS CHECK"
+        echo "------------------------------------------------------------"
+ 
+        PROTECTED='{{ protected_processes | join(" ") }}'
+ 
+        echo "Protected Process List:"
+        echo "$PROTECTED"
+ 
+        IS_PROTECTED=false
+        PROTECTED_MATCH=""
+ 
+        for P in $PROTECTED; do
+          if [ "$TOP_NAME" = "$P" ]; then
+            IS_PROTECTED=true
+            PROTECTED_MATCH="$P"
+            break
+          fi
+        done
+ 
+        if [ "$IS_PROTECTED" = true ]; then
+ 
+          echo ""
+          echo "============================================================"
+          echo "RESULT: PROTECTED PROCESS"
+          echo "============================================================"
+ 
+          echo "Protected Name : $PROTECTED_MATCH"
+          echo "PID            : $TOP_PID"
+          echo "CPU Usage      : ${TOP_CPU}%"
+          echo "Memory Usage   : ${TOP_MEM}%"
+          echo "ACTION         : NO AUTOMATIC REMEDIATION"
+ 
+          echo ""
+          echo "PROTECTED_PROCESS_FOUND:${TOP_NAME} PID:${TOP_PID} METRIC:${TOP_MEM}%"
+ 
+        else
+ 
+          echo ""
+          echo "============================================================"
+          echo "RESULT: NON-PROTECTED PROCESS"
+          echo "============================================================"
+ 
+          echo "Process Name : $TOP_NAME"
+          echo "PID          : $TOP_PID"
+          echo "CPU Usage    : ${TOP_CPU}%"
+          echo "Memory Usage : ${TOP_MEM}%"
+          echo "ACTION       : REMEDIATION MAY BE PROPOSED"
+ 
+          echo ""
+          echo "Top_process_not_protected:${TOP_NAME} PID:${TOP_PID} METRIC:${TOP_MEM}%"
+ 
+        fi
+ 
+        echo ""
+        echo "============================================================"
+        echo "        END OF MEMORY PRESSURE DIAGNOSIS"
+        echo "============================================================"
+ 
+      args:
+        executable: /bin/bash
+ 
       register: diagnose_result
-
-    - name: "STAGE 1 - Show diagnosis output"
-      tags: [diagnose]
-      debug:
+      changed_when: false
+ 
+      tags:
+        - diagnose
+ 
+ 
+    # ============================================================
+    # DISPLAY DIAGNOSIS OUTPUT
+    # ============================================================
+ 
+    - name: "STAGE 1 - Show complete diagnosis output"
+      ansible.builtin.debug:
         var: diagnose_result.stdout_lines
-
-    - name: "STAGE 1 - Flag whether the top process is protected"
-      tags: [diagnose]
-      set_fact:
-        top_process_protected: "{{ 'PROTECTED_PROCESS_FOUND' in diagnose_result.stdout }}"
-
-    - name: "STAGE 1 - Publish result for the workflow/orchestrator"
-      tags: [diagnose]
-      set_stats:
+ 
+      tags:
+        - diagnose
+ 
+ 
+    # ============================================================
+    # CHECK PROTECTED PROCESS
+    # ============================================================
+ 
+    - name: "STAGE 1 - Determine whether top process is protected"
+      ansible.builtin.set_fact:
+        top_process_protected: >-
+          {{ 'PROTECTED_PROCESS_FOUND' in diagnose_result.stdout }}
+ 
+      tags:
+        - diagnose
+ 
+ 
+    # ============================================================
+    # PUBLISH DIAGNOSIS
+    # ============================================================
+ 
+    - name: "STAGE 1 - Publish diagnosis result"
+      ansible.builtin.set_stats:
         data:
           top_process_protected: "{{ top_process_protected }}"
-
-    # ── Stage 2: CLEAR TEMP FILES (tags: remediate) ─────────────────────
-    - name: "STAGE 2 - Clear temp files"
-      tags: [remediate]
-      shell: |
+          diagnostic_output: "{{ diagnose_result.stdout }}"
+ 
+      tags:
+        - diagnose
+ 
+ 
+    # ============================================================
+    # STAGE 2: CLEAR TEMP FILES (safe, non-destructive cleanup)
+    # ============================================================
+ 
+    - name: "STAGE 2 - Clear temp files and orphaned shared memory"
+      ansible.builtin.shell: |
         set -o pipefail
-        echo '[STAGE 2 - CLEAR TEMP]'
+ 
+        echo "============================================================"
+        echo "        PIQUICKHEAL - MEMORY PRESSURE REMEDIATION"
+        echo "        STAGE 2: CLEAR TEMP FILES"
+        echo "============================================================"
+ 
         BEFORE=$(free -m | awk '/Mem/{print $7}')
+ 
         rm -rf /tmp/* /var/tmp/* 2>/dev/null || true
         find /dev/shm -type f -mmin +10 -delete 2>/dev/null || true
-        ipcs -m 2>/dev/null | awk 'NR>3 && $6==0{print $2}' | while read id; do ipcrm -m $id 2>/dev/null; done || true
+        ipcs -m 2>/dev/null | awk 'NR>3 && $6==0{print $2}' | while read -r id; do
+          ipcrm -m "$id" 2>/dev/null || true
+        done
+ 
         AFTER=$(free -m | awk '/Mem/{print $7}')
-        echo Freed:$(( AFTER - BEFORE ))MB
+ 
+        echo "Freed: $(( AFTER - BEFORE ))MB"
         free -h
-        echo '[/STAGE 2]'
+ 
+      args:
+        executable: /bin/bash
+ 
       register: clear_temp_result
-
+      changed_when: true
+ 
+      when:
+        - not (top_process_protected | default(false) | bool)
+ 
+      tags:
+        - remediate
+ 
+ 
     - name: "STAGE 2 - Show output"
-      tags: [remediate]
-      debug:
+      ansible.builtin.debug:
         var: clear_temp_result.stdout_lines
-
-    # ── Stage 3: DROP CACHES (tags: remediate) ──────────────────────────
-    - name: "STAGE 3 - Drop kernel caches"
-      tags: [remediate]
-      shell: |
+ 
+      when:
+        - not (top_process_protected | default(false) | bool)
+ 
+      tags:
+        - remediate
+ 
+ 
+    # ============================================================
+    # STAGE 3: DROP KERNEL CACHES (safe, reclaimable memory only)
+    # ============================================================
+ 
+    - name: "STAGE 3 - Drop kernel caches and compact memory"
+      ansible.builtin.shell: |
         set -o pipefail
-        echo '[STAGE 3 - DROP CACHES]'
+ 
+        echo "============================================================"
+        echo "        STAGE 3: DROP KERNEL CACHES"
+        echo "============================================================"
+ 
         BEFORE=$(free -m | awk '/Mem/{print $7}')
+ 
         sync && echo 3 > /proc/sys/vm/drop_caches
         echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
+ 
         AFTER=$(free -m | awk '/Mem/{print $7}')
-        echo Freed:$(( AFTER - BEFORE ))MB
+ 
+        echo "Freed: $(( AFTER - BEFORE ))MB"
         free -h
-        echo '[/STAGE 3]'
+ 
+      args:
+        executable: /bin/bash
+ 
       register: drop_caches_result
-
+      changed_when: true
+ 
+      when:
+        - not (top_process_protected | default(false) | bool)
+ 
+      tags:
+        - remediate
+ 
+ 
     - name: "STAGE 3 - Show output"
-      tags: [remediate]
-      debug:
+      ansible.builtin.debug:
         var: drop_caches_result.stdout_lines
-
-    # ── Stage 4: KILL IF STILL CRITICAL (tags: remediate) ───────────────
-    - name: "STAGE 4 - Kill a non-protected process only if still critical"
-      tags: [remediate]
-      shell: |
+ 
+      when:
+        - not (top_process_protected | default(false) | bool)
+ 
+      tags:
+        - remediate
+ 
+ 
+    # ============================================================
+    # STAGE 4: KILL TOP CONSUMER, ONLY IF STILL CRITICAL
+    # ============================================================
+ 
+    - name: "STAGE 4 - Kill top non-protected process if still critical"
+      ansible.builtin.shell: |
         set -o pipefail
-        echo '[STAGE 4 - KILL IF CRITICAL]'
-        PROTECTED='{{ protected_processes | join(" ") }}'
+ 
+        echo "============================================================"
+        echo "        STAGE 4: KILL IF STILL CRITICAL"
+        echo "============================================================"
+ 
         FREE_PCT=$(awk '/MemAvailable/{a=$2} /MemTotal/{t=$2} END{print int(a*100/t)}' /proc/meminfo)
-        echo "Available:${FREE_PCT}%"
-        if [ ${FREE_PCT:-20} -lt 15 ]; then
-          KILLED=false
-          ps aux --sort=-%mem --no-headers | awk '{print $2,$11}' | head -10 | while read PID CMD; do
-            BASENAME=$(basename $CMD 2>/dev/null || echo $CMD)
-            IS_PROTECTED=false
-            for P in $PROTECTED; do
-              echo $BASENAME | grep -qi $P && IS_PROTECTED=true && break
-            done
-            if [ $IS_PROTECTED = true ]; then
-              echo "Skipped_protected:$BASENAME PID:$PID"
-              continue
-            fi
-            echo "Must_kill:$BASENAME PID:$PID"
-            kill -15 $PID 2>/dev/null
-            sleep 5
-            ps -p $PID > /dev/null 2>&1 && kill -9 $PID 2>/dev/null
-            KILLED=true
-            break
-          done
-          [ "$KILLED" = false ] && echo No_non_protected_high_mem_process_found || true
-        else
-          echo Cleanup_sufficient_no_kill_needed
+ 
+        echo "Available: ${FREE_PCT}%"
+ 
+        if [ "${FREE_PCT:-100}" -ge {{ mem_critical_available_pct }} ]; then
+          echo "Cleanup_sufficient_no_kill_needed"
+          exit 0
         fi
+ 
+        echo ""
+        echo "[1] IDENTIFYING CURRENT TOP MEMORY PROCESS"
+        echo "------------------------------------------------------------"
+ 
+        TOP_LINE=$(ps -eo pid=,ppid=,user=,pcpu=,pmem=,comm= --sort=-pmem | head -n 1)
+ 
+        if [ -z "$TOP_LINE" ]; then
+          echo "ERROR: Unable to identify top memory-consuming process"
+          exit 1
+        fi
+ 
+        TOP_PID=$(echo "$TOP_LINE" | awk '{print $1}')
+        TOP_PPID=$(echo "$TOP_LINE" | awk '{print $2}')
+        TOP_USER=$(echo "$TOP_LINE" | awk '{print $3}')
+        TOP_CPU=$(echo "$TOP_LINE" | awk '{print $4}')
+        TOP_MEM=$(echo "$TOP_LINE" | awk '{print $5}')
+        TOP_NAME=$(echo "$TOP_LINE" | awk '{print $6}')
+ 
+        echo "Target Process : $TOP_NAME"
+        echo "Target PID     : $TOP_PID"
+        echo "Parent PID     : $TOP_PPID"
+        echo "User           : $TOP_USER"
+        echo "CPU Usage      : ${TOP_CPU}%"
+        echo "Memory Usage   : ${TOP_MEM}%"
+ 
+        echo ""
+        echo "[2] PROTECTED PROCESS VALIDATION"
+        echo "------------------------------------------------------------"
+ 
+        PROTECTED='{{ protected_processes | join(" ") }}'
+ 
+        IS_PROTECTED=false
+ 
+        for P in $PROTECTED; do
+          if [ "$TOP_NAME" = "$P" ]; then
+            IS_PROTECTED=true
+            break
+          fi
+        done
+ 
+        if [ "$IS_PROTECTED" = true ]; then
+ 
+          echo "============================================================"
+          echo "PROTECTED PROCESS DETECTED"
+          echo "============================================================"
+ 
+          echo "Process: $TOP_NAME"
+          echo "PID    : $TOP_PID"
+          echo "ACTION : NO REMEDIATION"
+ 
+          echo "PROTECTED_PROCESS_FOUND:${TOP_NAME} PID:${TOP_PID}"
+ 
+          exit 0
+ 
+        fi
+ 
+        echo ""
+        echo "[3] PROCESS VALIDATION"
+        echo "------------------------------------------------------------"
+ 
+        if ! kill -0 "$TOP_PID" 2>/dev/null; then
+          echo "Process PID $TOP_PID no longer exists."
+          echo "REMEDIATION_STATUS: NOT_REQUIRED"
+          exit 0
+        fi
+ 
+        echo "Process PID $TOP_PID is active."
+ 
+        echo ""
+        echo "[4] REMEDIATION ACTION"
+        echo "------------------------------------------------------------"
+ 
+        echo "Sending SIGTERM to PID $TOP_PID..."
+        kill -15 "$TOP_PID" 2>/dev/null || true
+ 
+        sleep 3
+ 
+        if kill -0 "$TOP_PID" 2>/dev/null; then
+          echo "Process is still running."
+          echo "Sending SIGKILL to PID $TOP_PID..."
+          kill -9 "$TOP_PID" 2>/dev/null || true
+        else
+          echo "Process stopped gracefully."
+        fi
+ 
+        sleep 1
+ 
+        echo ""
+        echo "[5] POST-REMEDIATION CHECK"
+        echo "------------------------------------------------------------"
+ 
+        if kill -0 "$TOP_PID" 2>/dev/null; then
+          echo "PID $TOP_PID is still running."
+          echo "REMEDIATION_STATUS: FAILED"
+        else
+          echo "PID $TOP_PID is no longer running."
+          echo "REMEDIATION_STATUS: SUCCESS"
+        fi
+ 
         free -h
-        echo "$(date '+%Y-%m-%d %H:%M:%S IST') [HEALED memory_pressure] $(hostname)" >> {{ heal_log_path }}
-        echo '[/STAGE 4]'
-      register: kill_if_critical_result
-
+ 
+      args:
+        executable: /bin/bash
+ 
+      register: kill_result
+      changed_when: true
+ 
+      when:
+        - not (top_process_protected | default(false) | bool)
+ 
+      tags:
+        - remediate
+ 
+ 
     - name: "STAGE 4 - Show output"
-      tags: [remediate]
-      debug:
-        var: kill_if_critical_result.stdout_lines
+      ansible.builtin.debug:
+        var: kill_result.stdout_lines
+ 
+      when:
+        - not (top_process_protected | default(false) | bool)
+ 
+      tags:
+        - remediate
+ 
+ 
+    - name: "STAGE 4 - Publish remediation output"
+      ansible.builtin.set_stats:
+        data:
+          remediation_output: "{{ kill_result.stdout | default('') }}"
+ 
+      when:
+        - not (top_process_protected | default(false) | bool)
+ 
+      tags:
+        - remediate
+ 
+ 
+    # ============================================================
+    # STAGE 5: VALIDATE MEMORY RECOVERY
+    # ============================================================
+ 
+    - name: "STAGE 5 - Poll memory usage until recovery"
+      ansible.builtin.shell: |
+        awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{printf "%.2f", (t-a)*100/t}' /proc/meminfo
+ 
+      args:
+        executable: /bin/bash
+ 
+      register: mem_check
+ 
+      changed_when: false
+      failed_when: false
+ 
+      until:
+        - (mem_check.stdout | default('100') | float) < mem_recover_threshold
+ 
+      retries: 6
+      delay: 5
+ 
+      when:
+        - not (top_process_protected | default(false) | bool)
+ 
+      tags:
+        - validate
+ 
+ 
+    # ============================================================
+    # RECORD HEAL RESULT
+    # ============================================================
+ 
+    - name: "STAGE 5 - Record heal result"
+      ansible.builtin.shell: |
+        mkdir -p "$(dirname "{{ heal_log_path }}")"
+ 
+        MEM_VALUE="{{ mem_check.stdout | default('100') | trim }}"
+ 
+        if awk "BEGIN {exit !($MEM_VALUE < {{ mem_recover_threshold }})}"; then
+          STATUS="HEALED"
+        else
+          STATUS="HEAL_FAILED"
+        fi
+ 
+        echo "$(date '+%Y-%m-%d %H:%M:%S %Z') [$STATUS memory_pressure] $(hostname)" \
+>> "{{ heal_log_path }}"
+ 
+      args:
+        executable: /bin/bash
+ 
+      changed_when: true
+ 
+      when:
+        - not (top_process_protected | default(false) | bool)
+ 
+      tags:
+        - validate
+ 
+ 
+    # ============================================================
+    # FINAL RESULT
+    # ============================================================
+ 
+    - name: "STAGE 5 - Report final outcome"
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            'HEAL_CONFIRMED_MEMORY_BELOW_THRESHOLD'
+            if (mem_check.stdout | default('100') | float) < mem_recover_threshold
+            else
+            'HEAL_FAILED_MEMORY_STILL_ELEVATED'
+          }}
+ 
+      when:
+        - not (top_process_protected | default(false) | bool)
+ 
+      tags:
+        - validate
