@@ -1,0 +1,334 @@
+---
+# PiQuickHeal - Generic Service Down Diagnosis and Remediation
+#
+# AWX Job Templates:
+#
+# 1. piquickheal-service_down-diagnose
+#    Job Tags: diagnose
+#
+# 2. piquickheal-service_down-remediate
+#    Job Tags: remediate,validate
+#
+# Used for any service_down alert whose parsed service_name doesn't match
+# a dedicated handler's aliases (see backend/services/service_handlers/
+# __init__.py) — currently that's everything except Apache, which has its
+# own richer diagnose/remediate playbooks (AWX_APACHE_PLAYBOOKS.md).
+#
+# {{ service_name }} is passed as an extra_var by PiQuickHeal on every
+# launch (see ansible_diagnose.build_extra_vars) — the first word of the
+# Nagios service_description, lowercased. It is used here AS the systemd
+# unit name directly (no per-distro mapping like Apache's apache_unit), so
+# the Nagios service_description's first word MUST equal the real systemd
+# unit name for the service being monitored.
+#
+# AWX:
+# Limit is set per-launch by PiQuickHeal's launch_awx_job() as
+# {"limit": hostname} — leave Limit blank on both Job Templates, but check
+# "Prompt on Launch" for it so AWX actually honors the per-launch value.
+#
+# Example:
+#
+# Limit:
+# ubuntu-patch.us-central1-a.c.project-49091190-d07c-4079-8e2.internal
+
+- name: PiQuickHeal - Service Down
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+
+    service_recover_retries: 6
+    service_recover_delay: 5
+
+    heal_log_path: /var/log/piquickheal/heal.log
+
+  tasks:
+
+    # ============================================================
+    # STAGE 1: DIAGNOSE
+    # ============================================================
+
+    - name: "STAGE 1 - Check current service status (machine-parseable)"
+      ansible.builtin.command: "systemctl is-active {{ service_name }}"
+      register: is_active_result
+      changed_when: false
+      failed_when: false
+
+      tags:
+        - diagnose
+
+
+    - name: "STAGE 1 - Diagnose service status"
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        echo "============================================================"
+        echo "        PIQUICKHEAL - SERVICE DOWN DIAGNOSIS"
+        echo "============================================================"
+
+        echo ""
+        echo "[1] SERVICE STATE"
+        echo "------------------------------------------------------------"
+
+        echo "Service Name : {{ service_name }}"
+        echo "State        : {{ is_active_result.stdout | default('unknown') }}"
+
+        echo ""
+        echo "[2] FULL SERVICE STATUS"
+        echo "------------------------------------------------------------"
+
+        systemctl status {{ service_name }} --no-pager -l || true
+
+        echo ""
+        echo "[3] RESULT"
+        echo "------------------------------------------------------------"
+
+        STATE="{{ is_active_result.stdout | default('unknown') }}"
+
+        if [ "$STATE" = "active" ]; then
+
+          echo "============================================================"
+          echo "RESULT: SERVICE ALREADY ACTIVE"
+          echo "============================================================"
+
+          echo "Service Name : {{ service_name }}"
+          echo "State        : $STATE"
+          echo "ACTION       : NO AUTOMATIC REMEDIATION"
+
+          echo ""
+          echo "Service_already_active:{{ service_name }} STATE:$STATE"
+
+        else
+
+          echo "============================================================"
+          echo "RESULT: SERVICE NOT ACTIVE"
+          echo "============================================================"
+
+          echo "Service Name : {{ service_name }}"
+          echo "State        : $STATE"
+          echo "ACTION       : REMEDIATION MAY BE PROPOSED"
+
+          echo ""
+          echo "Service_not_active:{{ service_name }} STATE:$STATE"
+
+        fi
+
+        echo ""
+        echo "============================================================"
+        echo "        END OF SERVICE DOWN DIAGNOSIS"
+        echo "============================================================"
+
+      args:
+        executable: /bin/bash
+
+      register: diagnose_result
+      changed_when: false
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # DISPLAY DIAGNOSIS OUTPUT
+    # ============================================================
+
+    - name: "STAGE 1 - Show complete diagnosis output"
+      ansible.builtin.debug:
+        var: diagnose_result.stdout_lines
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # CHECK CURRENT STATE
+    # ============================================================
+
+    - name: "STAGE 1 - Determine whether service is already active"
+      ansible.builtin.set_fact:
+        service_already_active: >-
+          {{ 'Service_already_active' in diagnose_result.stdout }}
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # PUBLISH DIAGNOSIS
+    # ============================================================
+
+    - name: "STAGE 1 - Publish diagnosis result"
+      ansible.builtin.set_stats:
+        data:
+          service_already_active: "{{ service_already_active }}"
+          service_status: "{{ is_active_result.stdout | default('unknown') | trim }}"
+          diagnostic_output: "{{ diagnose_result.stdout }}"
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # STAGE 2: REMEDIATION
+    # ============================================================
+
+    - name: "STAGE 2 - Start the service"
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        echo "============================================================"
+        echo "        PIQUICKHEAL - SERVICE DOWN REMEDIATION"
+        echo "============================================================"
+
+        echo ""
+        echo "[1] START ACTION"
+        echo "------------------------------------------------------------"
+
+        echo "Sending systemctl start to {{ service_name }}..."
+
+        systemctl start {{ service_name }}
+        RC=$?
+
+        echo "systemctl start rc: $RC"
+
+        echo ""
+        echo "[2] POST-START CHECK"
+        echo "------------------------------------------------------------"
+
+        POST_STATUS=$(systemctl is-active {{ service_name }} 2>&1)
+
+        echo "Post-start status: $POST_STATUS"
+
+        echo ""
+        echo "[3] RESULT"
+        echo "------------------------------------------------------------"
+
+        if [ "$POST_STATUS" = "active" ]; then
+          echo "REMEDIATION_STATUS: SUCCESS"
+        else
+          echo "REMEDIATION_STATUS: FAILED"
+        fi
+
+        echo ""
+        echo "============================================================"
+        echo "        END OF SERVICE DOWN REMEDIATION"
+        echo "============================================================"
+
+      args:
+        executable: /bin/bash
+
+      register: start_result
+      changed_when: true
+
+      when:
+        - not (service_already_active | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    # ============================================================
+    # DISPLAY REMEDIATION OUTPUT
+    # ============================================================
+
+    - name: "STAGE 2 - Show remediation output"
+      ansible.builtin.debug:
+        var: start_result.stdout_lines
+
+      when:
+        - not (service_already_active | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    # ============================================================
+    # PUBLISH REMEDIATION OUTPUT
+    # ============================================================
+
+    - name: "STAGE 2 - Publish remediation output"
+      ansible.builtin.set_stats:
+        data:
+          remediation_output: "{{ start_result.stdout | default('') }}"
+
+      when:
+        - not (service_already_active | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    # ============================================================
+    # STAGE 3: VALIDATE SERVICE RECOVERY
+    # ============================================================
+
+    - name: "STAGE 3 - Poll service until active"
+      ansible.builtin.command: "systemctl is-active {{ service_name }}"
+      register: service_check
+
+      changed_when: false
+      failed_when: false
+
+      until:
+        - (service_check.stdout | default('unknown') | trim) == 'active'
+
+      retries: "{{ service_recover_retries }}"
+      delay: "{{ service_recover_delay }}"
+
+      when:
+        - not (service_already_active | default(false) | bool)
+
+      tags:
+        - validate
+
+
+    # ============================================================
+    # RECORD HEAL RESULT
+    # ============================================================
+
+    - name: "STAGE 3 - Record heal result"
+      ansible.builtin.shell: |
+        mkdir -p "$(dirname "{{ heal_log_path }}")"
+
+        SERVICE_STATE="{{ service_check.stdout | default('unknown') | trim }}"
+
+        if [ "$SERVICE_STATE" = "active" ]; then
+          STATUS="HEALED"
+        else
+          STATUS="HEAL_FAILED"
+        fi
+
+        echo "$(date '+%Y-%m-%d %H:%M:%S %Z') [$STATUS service_down:{{ service_name }}] $(hostname)" >> "{{ heal_log_path }}"
+
+      args:
+        executable: /bin/bash
+
+      changed_when: true
+
+      when:
+        - not (service_already_active | default(false) | bool)
+
+      tags:
+        - validate
+
+
+    # ============================================================
+    # FINAL RESULT
+    # ============================================================
+
+    - name: "STAGE 3 - Report final outcome"
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            'HEAL_CONFIRMED_SERVICE_ACTIVE'
+            if (service_check.stdout | default('unknown') | trim) == 'active'
+            else
+            'HEAL_FAILED_SERVICE_STILL_DOWN'
+          }}
+
+      when:
+        - not (service_already_active | default(false) | bool)
+
+      tags:
+        - validate
