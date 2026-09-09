@@ -1,0 +1,467 @@
+---
+# PiQuickHeal - Swap Pressure Diagnosis and Remediation
+#
+# AWX Job Templates:
+#
+# 1. piquickheal-swap_pressure-diagnose
+#    Job Tags: diagnose
+#
+# 2. piquickheal-swap_pressure-remediate
+#    Job Tags: remediate,validate
+#
+# Workflow:
+#
+# Diagnose → Approval → Remediate → Validate
+#
+# AWX:
+# Use the Limit field to select a specific host.
+
+- name: PiQuickHeal - Swap Pressure
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+
+    swap_recover_threshold: 20
+
+    protected_processes:
+      - systemd
+      - init
+      - sshd
+      - ssh
+      - NetworkManager
+      - dbus-daemon
+      - dockerd
+      - containerd
+      - mysqld
+      - postgres
+      - postgresql
+      - nginx
+      - httpd
+
+    heal_log_path: /var/log/piquickheal/heal.log
+
+  tasks:
+
+    # ============================================================
+    # STAGE 1: DIAGNOSE
+    # ============================================================
+
+    - name: "STAGE 1 - Diagnose top swap consumer"
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        echo "============================================================"
+        echo "        PIQUICKHEAL - SWAP PRESSURE DIAGNOSIS"
+        echo "============================================================"
+
+        echo ""
+        echo "[1] SYSTEM UPTIME AND SWAP OVERVIEW"
+        echo "------------------------------------------------------------"
+
+        uptime
+        free -h
+
+        echo ""
+        echo "[2] CURRENT SWAP USAGE"
+        echo "------------------------------------------------------------"
+
+        SWAP_USAGE=$(awk '/SwapTotal/{t=$2} /SwapFree/{f=$2} END{if (t>0) printf "%.2f", (t-f)*100/t; else print "0.00"}' /proc/meminfo)
+
+        echo "Total Swap Usage: ${SWAP_USAGE:-UNKNOWN}%"
+
+        echo ""
+        echo "[3] TOP 10 SWAP-CONSUMING PROCESSES"
+        echo "------------------------------------------------------------"
+
+        for pid in $(ls /proc | grep -E '^[0-9]+$'); do
+          if [ -r "/proc/$pid/status" ]; then
+            swap_kb=$(awk '/VmSwap/{print $2}' "/proc/$pid/status" 2>/dev/null)
+            if [ -n "$swap_kb" ] && [ "$swap_kb" -gt 0 ] 2>/dev/null; then
+              name=$(awk '/Name/{print $2}' "/proc/$pid/status" 2>/dev/null)
+              echo "$swap_kb $pid $name"
+            fi
+          fi
+        done | sort -rn | head -n 10 | awk '{printf "%-10s %-10s %s\n", $1"KB", $2, $3}'
+
+        echo ""
+        echo "[4] TOP SWAP CONSUMER DETAILS"
+        echo "------------------------------------------------------------"
+
+        TOP_LINE=$(for pid in $(ls /proc | grep -E '^[0-9]+$'); do
+          if [ -r "/proc/$pid/status" ]; then
+            swap_kb=$(awk '/VmSwap/{print $2}' "/proc/$pid/status" 2>/dev/null)
+            if [ -n "$swap_kb" ] && [ "$swap_kb" -gt 0 ] 2>/dev/null; then
+              name=$(awk '/Name/{print $2}' "/proc/$pid/status" 2>/dev/null)
+              echo "$swap_kb $pid $name"
+            fi
+          fi
+        done | sort -rn | head -n 1)
+
+        if [ -z "$TOP_LINE" ]; then
+          echo "No process is currently using swap."
+          echo "TOP_SWAP_PID:none"
+        else
+          TOP_SWAP_KB=$(echo "$TOP_LINE" | awk '{print $1}')
+          TOP_PID=$(echo "$TOP_LINE" | awk '{print $2}')
+          TOP_NAME=$(echo "$TOP_LINE" | awk '{print $3}')
+
+          echo "Process Name : $TOP_NAME"
+          echo "PID          : $TOP_PID"
+          echo "Swap Usage   : ${TOP_SWAP_KB}KB"
+
+          echo ""
+          echo "[5] PROTECTED PROCESS CHECK"
+          echo "------------------------------------------------------------"
+
+          PROTECTED='{{ protected_processes | join(" ") }}'
+
+          echo "Protected Process List:"
+          echo "$PROTECTED"
+
+          IS_PROTECTED=false
+          PROTECTED_MATCH=""
+
+          for P in $PROTECTED; do
+            if [ "$TOP_NAME" = "$P" ]; then
+              IS_PROTECTED=true
+              PROTECTED_MATCH="$P"
+              break
+            fi
+          done
+
+          if [ "$IS_PROTECTED" = true ]; then
+
+            echo ""
+            echo "============================================================"
+            echo "RESULT: PROTECTED PROCESS"
+            echo "============================================================"
+
+            echo "Protected Name : $PROTECTED_MATCH"
+            echo "PID            : $TOP_PID"
+            echo "Swap Usage     : ${TOP_SWAP_KB}KB"
+            echo "ACTION         : NO AUTOMATIC REMEDIATION"
+
+            echo ""
+            echo "PROTECTED_PROCESS_FOUND:${TOP_NAME} PID:${TOP_PID} METRIC:${TOP_SWAP_KB}KB"
+
+          else
+
+            echo ""
+            echo "============================================================"
+            echo "RESULT: NON-PROTECTED PROCESS"
+            echo "============================================================"
+
+            echo "Process Name : $TOP_NAME"
+            echo "PID          : $TOP_PID"
+            echo "Swap Usage   : ${TOP_SWAP_KB}KB"
+            echo "ACTION       : REMEDIATION MAY BE PROPOSED"
+
+            echo ""
+            echo "Top_process_not_protected:${TOP_NAME} PID:${TOP_PID} METRIC:${TOP_SWAP_KB}KB"
+
+          fi
+        fi
+
+        echo ""
+        echo "============================================================"
+        echo "        END OF SWAP PRESSURE DIAGNOSIS"
+        echo "============================================================"
+
+      args:
+        executable: /bin/bash
+
+      register: diagnose_result
+      changed_when: false
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # DISPLAY DIAGNOSIS OUTPUT
+    # ============================================================
+
+    - name: "STAGE 1 - Show complete diagnosis output"
+      ansible.builtin.debug:
+        var: diagnose_result.stdout_lines
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # CHECK PROTECTED PROCESS
+    # ============================================================
+
+    - name: "STAGE 1 - Determine whether top process is protected"
+      ansible.builtin.set_fact:
+        top_process_protected: >-
+          {{ 'PROTECTED_PROCESS_FOUND' in diagnose_result.stdout }}
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # PUBLISH DIAGNOSIS
+    # ============================================================
+
+    - name: "STAGE 1 - Publish diagnosis result"
+      ansible.builtin.set_stats:
+        data:
+          top_process_protected: "{{ top_process_protected }}"
+          diagnostic_output: "{{ diagnose_result.stdout }}"
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # STAGE 2: REMEDIATION — reclaim swap by dropping caches, then
+    # kill the top non-protected swap consumer only if still critical.
+    # No process is killed just for using swap; swap use alone is not
+    # abnormal. Only act if a non-protected process holds the largest
+    # swap share AND overall swap usage stays above threshold after
+    # cache reclaim.
+    # ============================================================
+
+    - name: "STAGE 2 - Reclaim reclaimable memory (drop caches)"
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        echo "============================================================"
+        echo "        PIQUICKHEAL - SWAP PRESSURE REMEDIATION"
+        echo "        STAGE 2: RECLAIM CACHES"
+        echo "============================================================"
+
+        BEFORE=$(awk '/SwapTotal/{t=$2} /SwapFree/{f=$2} END{if (t>0) printf "%.2f", (t-f)*100/t; else print "0.00"}' /proc/meminfo)
+
+        sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+        AFTER=$(awk '/SwapTotal/{t=$2} /SwapFree/{f=$2} END{if (t>0) printf "%.2f", (t-f)*100/t; else print "0.00"}' /proc/meminfo)
+
+        echo "Swap usage before: ${BEFORE}%"
+        echo "Swap usage after cache reclaim: ${AFTER}%"
+
+      args:
+        executable: /bin/bash
+
+      register: reclaim_result
+      changed_when: true
+
+      when:
+        - not (top_process_protected | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    - name: "STAGE 2 - Show reclaim output"
+      ansible.builtin.debug:
+        var: reclaim_result.stdout_lines
+
+      when:
+        - not (top_process_protected | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    - name: "STAGE 2 - Identify current top swap consumer if still critical"
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        SWAP_USAGE=$(awk '/SwapTotal/{t=$2} /SwapFree/{f=$2} END{if (t>0) printf "%.2f", (t-f)*100/t; else print "0.00"}' /proc/meminfo)
+
+        echo "============================================================"
+        echo "        STAGE 2: KILL IF STILL CRITICAL"
+        echo "============================================================"
+        echo "Swap usage: ${SWAP_USAGE}%"
+
+        if awk "BEGIN {exit !($SWAP_USAGE < {{ swap_recover_threshold }})}"; then
+          echo "Swap usage already below threshold — no kill needed."
+          echo "REMEDIATION_STATUS: NOT_REQUIRED"
+          exit 0
+        fi
+
+        TOP_LINE=$(for pid in $(ls /proc | grep -E '^[0-9]+$'); do
+          if [ -r "/proc/$pid/status" ]; then
+            swap_kb=$(awk '/VmSwap/{print $2}' "/proc/$pid/status" 2>/dev/null)
+            if [ -n "$swap_kb" ] && [ "$swap_kb" -gt 0 ] 2>/dev/null; then
+              name=$(awk '/Name/{print $2}' "/proc/$pid/status" 2>/dev/null)
+              echo "$swap_kb $pid $name"
+            fi
+          fi
+        done | sort -rn | head -n 1)
+
+        if [ -z "$TOP_LINE" ]; then
+          echo "No process currently using swap."
+          echo "REMEDIATION_STATUS: NOT_REQUIRED"
+          exit 0
+        fi
+
+        TOP_PID=$(echo "$TOP_LINE" | awk '{print $2}')
+        TOP_NAME=$(echo "$TOP_LINE" | awk '{print $3}')
+
+        echo "Target Process : $TOP_NAME"
+        echo "Target PID     : $TOP_PID"
+
+        PROTECTED='{{ protected_processes | join(" ") }}'
+        IS_PROTECTED=false
+        for P in $PROTECTED; do
+          if [ "$TOP_NAME" = "$P" ]; then
+            IS_PROTECTED=true
+            break
+          fi
+        done
+
+        if [ "$IS_PROTECTED" = true ]; then
+          echo "PROTECTED_PROCESS_FOUND:${TOP_NAME} PID:${TOP_PID}"
+          echo "ACTION : NO REMEDIATION"
+          exit 0
+        fi
+
+        if ! kill -0 "$TOP_PID" 2>/dev/null; then
+          echo "Process PID $TOP_PID no longer exists."
+          echo "REMEDIATION_STATUS: NOT_REQUIRED"
+          exit 0
+        fi
+
+        echo "Sending SIGTERM to PID $TOP_PID..."
+        kill -15 "$TOP_PID" 2>/dev/null || true
+        sleep 3
+
+        if kill -0 "$TOP_PID" 2>/dev/null; then
+          echo "Process is still running. Sending SIGKILL to PID $TOP_PID..."
+          kill -9 "$TOP_PID" 2>/dev/null || true
+        else
+          echo "Process stopped gracefully."
+        fi
+
+        sleep 1
+
+        if kill -0 "$TOP_PID" 2>/dev/null; then
+          echo "PID $TOP_PID is still running."
+          echo "REMEDIATION_STATUS: FAILED"
+        else
+          echo "PID $TOP_PID is no longer running."
+          echo "REMEDIATION_STATUS: SUCCESS"
+        fi
+
+      args:
+        executable: /bin/bash
+
+      register: kill_result
+      changed_when: true
+
+      when:
+        - not (top_process_protected | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    - name: "STAGE 2 - Show kill output"
+      ansible.builtin.debug:
+        var: kill_result.stdout_lines
+
+      when:
+        - not (top_process_protected | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    - name: "STAGE 2 - Publish remediation output"
+      ansible.builtin.set_stats:
+        data:
+          remediation_output: "{{ (kill_result.stdout | default('')) + '\n' + (reclaim_result.stdout | default('')) }}"
+
+      when:
+        - not (top_process_protected | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    # ============================================================
+    # STAGE 3: VALIDATE SWAP RECOVERY
+    # ============================================================
+
+    - name: "STAGE 3 - Poll swap usage until recovery"
+      ansible.builtin.shell: |
+        awk '/SwapTotal/{t=$2} /SwapFree/{f=$2} END{if (t>0) printf "%.2f", (t-f)*100/t; else print "0.00"}' /proc/meminfo
+
+      args:
+        executable: /bin/bash
+
+      register: swap_check
+
+      changed_when: false
+      failed_when: false
+
+      until:
+        - (swap_check.stdout | default('100') | float) < swap_recover_threshold
+
+      retries: 6
+      delay: 5
+
+      when:
+        - not (top_process_protected | default(false) | bool)
+
+      tags:
+        - validate
+
+
+    # ============================================================
+    # RECORD HEAL RESULT
+    # ============================================================
+
+    - name: "STAGE 3 - Record heal result"
+      ansible.builtin.shell: |
+        mkdir -p "$(dirname "{{ heal_log_path }}")"
+
+        SWAP_VALUE="{{ swap_check.stdout | default('100') | trim }}"
+
+        if awk "BEGIN {exit !($SWAP_VALUE < {{ swap_recover_threshold }})}"; then
+          STATUS="HEALED"
+        else
+          STATUS="HEAL_FAILED"
+        fi
+
+        echo "$(date '+%Y-%m-%d %H:%M:%S %Z') [$STATUS swap_pressure] $(hostname)" \
+          >> "{{ heal_log_path }}"
+
+      args:
+        executable: /bin/bash
+
+      changed_when: true
+
+      when:
+        - not (top_process_protected | default(false) | bool)
+
+      tags:
+        - validate
+
+
+    # ============================================================
+    # FINAL RESULT
+    # ============================================================
+
+    - name: "STAGE 3 - Report final outcome"
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            'HEAL_CONFIRMED_SWAP_BELOW_THRESHOLD'
+            if (swap_check.stdout | default('100') | float) < swap_recover_threshold
+            else
+            'HEAL_FAILED_SWAP_STILL_ELEVATED'
+          }}
+
+      when:
+        - not (top_process_protected | default(false) | bool)
+
+      tags:
+        - validate
