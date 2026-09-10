@@ -133,7 +133,7 @@
     # writing anything. Run that first.
     # --------------------------------------------------------
 
-    tls_allow_selfsigned_regeneration: false
+    tls_allow_selfsigned_regeneration: true
 
     tls_selfsigned_dry_run: false
 
@@ -142,10 +142,19 @@
     # When no private key matching the certificate can be
     # found, generate a new keypair rather than refusing.
     #
-    # Off by default: a new key means every service and client
-    # pinned to the old key stops working, which is a bigger
-    # outage than an expired self-signed test certificate.
-    tls_selfsigned_allow_new_key: false
+    # ##################################################
+    # #  WARNING - NEW KEY GENERATION IS ENABLED       #
+    # ##################################################
+    #
+    # A new key means every service and client pinned to the
+    # old key stops working. The playbook cannot distinguish an
+    # orphaned test fixture from a production certificate whose
+    # key simply lives somewhere the search did not look, so on
+    # a host that terminates TLS this can break handshakes.
+    #
+    # Enabled here on request. Set to false to restore the
+    # refuse-by-default behaviour.
+    tls_selfsigned_allow_new_key: true
 
     # --------------------------------------------------------
     # Inspector source, deployed to the target in STAGE 4 and
@@ -917,16 +926,23 @@
     # --------------------------------------------------------
     # Whether remediation is allowed
     #
-    # Default false for safety.
+    # ##################################################
+    # #  WARNING - REMEDIATION IS ENABLED BY DEFAULT   #
+    # ##################################################
     #
-    # Set:
+    # This was flipped from false to true on request, so ANY
+    # launch of this playbook may modify certificate files on
+    # the target. There is no longer a safety default holding
+    # it back, including for scheduled jobs.
     #
-    #   -e tls_allow_remediation=true
+    # To make a single run read-only:
     #
-    # to enable remediation.
+    #   -e tls_allow_remediation=false
+    #
+    # or set it to false in the AWX job template variables.
     # --------------------------------------------------------
 
-    tls_allow_remediation: false
+    tls_allow_remediation: true
 
     # --------------------------------------------------------
     # Kubernetes namespace used for cert-manager detection
