@@ -241,6 +241,36 @@
       failed_when: false
       tags: [diagnose]
 
+    # NOTE: a single shell invocation's stdout can contain MULTIPLE
+    # chain records (one per cert in the file, delimited by
+    # ---RECORD-END---). This first pass flattens every record from
+    # every file into one flat list of raw per-record text blobs,
+    # trimmed so each blob starts cleanly with "PATH=". This also
+    # fixes multi-cert files that were previously collapsed into a
+    # single (and, due to the bug below, largely empty) entry.
+    - name: "STAGE 1 - Flatten chain-aware records across all files"
+      ansible.builtin.set_fact:
+        certificate_raw_records: >-
+          {{
+            certificate_raw_records | default([]) +
+            (
+              (item.stdout | default('')).split('---RECORD-END---')
+              | map('trim')
+              | select('match', '^PATH=')
+              | list
+            )
+          }}
+      loop: "{{ certificate_metadata_results.results }}"
+      when: item.rc == 0 and item.stdout is defined and item.stdout | length > 0
+      tags: [diagnose]
+
+    # Each raw record is now a single blob like "PATH=...\nCHAIN_INDEX=...".
+    # Splitting it into individual lines (via .split('\n')) is required
+    # before select('match', '^FIELD=') will work per field - a Jinja
+    # `match` test anchors at position 0 of the whole string being
+    # tested, so testing it against a multi-line blob only ever matches
+    # whichever field happens to be first. Testing against a list of
+    # single-line strings makes every field match correctly.
     - name: "STAGE 1 - Build discovered certificate records (one per chain entry)"
       ansible.builtin.set_fact:
         discovered_certificates: >-
@@ -260,9 +290,8 @@
             }]
           }}
       vars:
-        block: "{{ (item.stdout | default('')).split('---RECORD-END---') }}"
-      loop: "{{ certificate_metadata_results.results }}"
-      when: item.rc == 0 and item.stdout is defined and item.stdout | length > 0
+        block: "{{ item.split('\n') }}"
+      loop: "{{ certificate_raw_records | default([]) }}"
       tags: [diagnose]
 
     # --------------------------------------------------------
@@ -452,7 +481,7 @@
             'CRITICAL'
             if (discovered_certificates | selectattr('status', 'in', ['EXPIRED', 'CRITICAL']) | list | length) > 0
             else 'WARNING'
-            if (discovered_certificates | selectattr('status', 'equalto', 'EXPIRING_SOON') | list | length) > 0
+            if (discovered_certificates | selectattr('status', 'in', ['EXPIRING_SOON', 'UNKNOWN']) | list | length) > 0
             else 'HEALTHY'
           }}
       tags: [diagnose]
