@@ -1,0 +1,707 @@
+---
+# ============================================================
+# PiQuickHeal - TLS/SSL Certificate Expiry & Rotation
+# ============================================================
+#
+# Workflow: Diagnose -> Approval -> Remediate -> Validate
+#
+# AWX Job Templates:
+#   piquickheal-tls_certificate_rotation-diagnose   (tag: diagnose)
+#   piquickheal-tls_certificate_rotation-remediate  (tag: remediate)
+#   piquickheal-tls_certificate_rotation-validate   (tag: validate)
+#
+# ============================================================
+
+- name: PiQuickHeal - TLS/SSL Certificate Expiry and Rotation
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+
+    # --------------------------------------------------------
+    # Certificate policy
+    # --------------------------------------------------------
+
+    certificate_warning_days: 30
+    certificate_critical_days: 7
+
+    # --------------------------------------------------------
+    # Certificate discovery locations
+    # --------------------------------------------------------
+
+    certificate_search_roots:
+      - /etc
+      - /opt
+      - /srv
+      - /var/lib/postgresql
+      - /var/lib/mysql
+      - /var/lib/mysql-files
+      - /etc/kubernetes/pki
+      - /var/lib/kubelet/pki
+      - /etc/dovecot
+      - /etc/postfix
+
+    # System CA trust-store / trust-anchor locations. 
+    certificate_exclude_path_patterns:
+      - '^/etc/ssl/certs/'
+      - '^/etc/pki/ca-trust/'
+      - '^/etc/pki/tls/certs/ca-bundle'
+      - '^/usr/share/ca-certificates/'
+      - '^/etc/pki/nssdb/'
+
+    # Formats we can safely parse with `openssl x509`.
+    certificate_extensions:
+      - "*.crt"
+      - "*.pem"
+      - "*.cer"
+
+    # --------------------------------------------------------
+    # Runtime directory
+    # --------------------------------------------------------
+
+    piquickheal_log_directory: /var/log/piquickheal
+    piquickheal_log_file: /var/log/piquickheal/tls_certificate_rotation.log
+
+    # --------------------------------------------------------
+    # TLS probing
+    # --------------------------------------------------------
+
+    tls_probe_timeout: 5
+
+    # Ports that negotiate TLS via STARTTLS rather than
+    # immediate/implicit TLS. Anything not listed here is
+    # probed as implicit TLS.
+    starttls_port_map:
+      - { port: 25,  protocol: smtp }
+      - { port: 587, protocol: smtp }
+      - { port: 143, protocol: imap }
+      - { port: 110, protocol: pop3 }
+      - { port: 389, protocol: ldap }
+      - { port: 5222, protocol: xmpp-client }
+
+    # --------------------------------------------------------
+    # Certificate renewal
+    # --------------------------------------------------------
+
+    allow_certbot_renewal: true
+
+  tasks:
+
+    # ========================================================
+    # STAGE 1 - DIAGNOSE
+    # ========================================================
+
+    - name: "STAGE 1 - Initialize diagnosis"
+      ansible.builtin.set_fact:
+        certificate_diagnosis_status: "STARTING"
+        discovered_certificates: []
+        discovered_tls_endpoints: []
+      tags: [diagnose]
+
+    - name: "STAGE 1 - Check required binaries"
+      ansible.builtin.command: "which {{ item }}"
+      register: required_binaries
+      loop: [openssl, ss]
+      changed_when: false
+      failed_when: false
+      tags: [diagnose]
+
+    - name: "STAGE 1 - Validate discovery tools"
+      ansible.builtin.assert:
+        that: "required_binaries.results | selectattr('rc', 'ne', 0) | list | length == 0"
+        fail_msg: "Required tools (openssl, ss) are not available on the target host."
+      tags: [diagnose]
+
+    # --------------------------------------------------------
+    # Discover certificate files
+    # --------------------------------------------------------
+
+    - name: "STAGE 1 - Discover parseable certificate files"
+      ansible.builtin.find:
+        paths: "{{ certificate_search_roots }}"
+        patterns: "{{ certificate_extensions }}"
+        recurse: true
+        file_type: file
+        hidden: true
+      register: certificate_files
+      changed_when: false
+      failed_when: false
+      tags: [diagnose]
+
+    - name: "STAGE 1 - Build certificate candidate list"
+      ansible.builtin.set_fact:
+        certificate_candidates: >-
+          {{
+            certificate_files.files | default([])
+            | map(attribute='path')
+            | list
+            | reject('regex_search', certificate_exclude_path_patterns | join('|'))
+            | list
+          }}
+      tags: [diagnose]
+
+    # --------------------------------------------------------
+    # Parse EVERY certificate in each file (chain-aware)
+    #
+    # A file may contain 1..N PEM blocks (leaf + intermediates).
+    # This splits on PEM boundaries and inspects each block
+    # independently.
+    # --------------------------------------------------------
+
+    - name: "STAGE 1 - Inspect all certificates in each file (chain-aware)"
+      ansible.builtin.shell: |
+        set -o pipefail
+        FILE="{{ item }}"
+
+        # Count how many certificate blocks are in this file.
+        COUNT=$(grep -c 'BEGIN CERTIFICATE' "$FILE" 2>/dev/null || echo 0)
+
+        if [ "$COUNT" -eq 0 ]; then
+          # Not a PEM bundle we recognise (could be DER, or not
+          # a cert at all) - try DER as a fallback, else skip.
+          if openssl x509 -inform DER -in "$FILE" -noout >/dev/null 2>&1; then
+            COUNT=1
+            DER_FALLBACK=1
+          else
+            exit 2
+          fi
+        fi
+
+        for i in $(seq 1 "$COUNT"); do
+          if [ "${DER_FALLBACK:-0}" = "1" ]; then
+            CERT_PEM="$FILE"
+            INFORM="DER"
+          else
+            CERT_PEM=$(awk -v n="$i" '
+              /BEGIN CERTIFICATE/{c++}
+              c==n{print}
+              c==n && /END CERTIFICATE/{exit}
+            ' "$FILE")
+            INFORM="PEM"
+          fi
+
+          if [ "$INFORM" = "DER" ]; then
+            SUBJECT=$(openssl x509 -inform DER -in "$FILE" -noout -subject 2>/dev/null | sed 's/^subject=//')
+            ISSUER=$(openssl x509 -inform DER -in "$FILE" -noout -issuer 2>/dev/null | sed 's/^issuer=//')
+            SERIAL=$(openssl x509 -inform DER -in "$FILE" -noout -serial 2>/dev/null | cut -d= -f2)
+            FINGERPRINT=$(openssl x509 -inform DER -in "$FILE" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+            NOT_AFTER=$(openssl x509 -inform DER -in "$FILE" -noout -enddate 2>/dev/null | cut -d= -f2-)
+          else
+            SUBJECT=$(printf '%s\n' "$CERT_PEM" | openssl x509 -noout -subject 2>/dev/null | sed 's/^subject=//')
+            ISSUER=$(printf '%s\n' "$CERT_PEM" | openssl x509 -noout -issuer 2>/dev/null | sed 's/^issuer=//')
+            SERIAL=$(printf '%s\n' "$CERT_PEM" | openssl x509 -noout -serial 2>/dev/null | cut -d= -f2)
+            FINGERPRINT=$(printf '%s\n' "$CERT_PEM" | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+            NOT_AFTER=$(printf '%s\n' "$CERT_PEM" | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2-)
+          fi
+
+          END_EPOCH=$(date -d "$NOT_AFTER" +%s 2>/dev/null || echo 0)
+          NOW_EPOCH=$(date +%s)
+          if [ "$END_EPOCH" -gt 0 ]; then
+            DAYS_REMAINING=$(( (END_EPOCH - NOW_EPOCH) / 86400 ))
+          else
+            DAYS_REMAINING=-99999
+          fi
+
+          if [ "$DAYS_REMAINING" -lt 0 ]; then STATUS="EXPIRED"
+          elif [ "$DAYS_REMAINING" -le {{ certificate_critical_days }} ]; then STATUS="CRITICAL"
+          elif [ "$DAYS_REMAINING" -le {{ certificate_warning_days }} ]; then STATUS="EXPIRING_SOON"
+          else STATUS="HEALTHY"
+          fi
+
+          printf '%s\n' \
+            "PATH=$FILE" \
+            "CHAIN_INDEX=$i" \
+            "CHAIN_TOTAL=$COUNT" \
+            "SUBJECT=$SUBJECT" \
+            "ISSUER=$ISSUER" \
+            "SERIAL=$SERIAL" \
+            "FINGERPRINT=$FINGERPRINT" \
+            "NOT_AFTER=$NOT_AFTER" \
+            "DAYS_REMAINING=$DAYS_REMAINING" \
+            "STATUS=$STATUS" \
+            "---RECORD-END---"
+        done
+      args:
+        executable: /bin/bash
+      loop: "{{ certificate_candidates }}"
+      register: certificate_metadata_results
+      changed_when: false
+      failed_when: false
+      tags: [diagnose]
+
+    - name: "STAGE 1 - Build discovered certificate records (one per chain entry)"
+      ansible.builtin.set_fact:
+        discovered_certificates: >-
+          {{
+            discovered_certificates + [{
+              'path': (block | select('match', '^PATH=') | map('regex_replace', '^PATH=', '') | first | default('')),
+              'chain_index': (block | select('match', '^CHAIN_INDEX=') | map('regex_replace', '^CHAIN_INDEX=', '') | first | default('1')),
+              'chain_total': (block | select('match', '^CHAIN_TOTAL=') | map('regex_replace', '^CHAIN_TOTAL=', '') | first | default('1')),
+              'subject': (block | select('match', '^SUBJECT=') | map('regex_replace', '^SUBJECT=', '') | first | default('')),
+              'issuer': (block | select('match', '^ISSUER=') | map('regex_replace', '^ISSUER=', '') | first | default('')),
+              'serial': (block | select('match', '^SERIAL=') | map('regex_replace', '^SERIAL=', '') | first | default('')),
+              'fingerprint': (block | select('match', '^FINGERPRINT=') | map('regex_replace', '^FINGERPRINT=', '') | first | default('')),
+              'not_after': (block | select('match', '^NOT_AFTER=') | map('regex_replace', '^NOT_AFTER=', '') | first | default('')),
+              'days_remaining': ((block | select('match', '^DAYS_REMAINING=') | map('regex_replace', '^DAYS_REMAINING=', '') | first | default('-99999')) | int),
+              'status': (block | select('match', '^STATUS=') | map('regex_replace', '^STATUS=', '') | first | default('UNKNOWN')),
+              'role': ('LEAF' if (block | select('match', '^CHAIN_INDEX=1$') | list | length) > 0 else 'INTERMEDIATE_OR_CHAIN')
+            }]
+          }}
+      vars:
+        block: "{{ (item.stdout | default('')).split('---RECORD-END---') }}"
+      loop: "{{ certificate_metadata_results.results }}"
+      when: item.rc == 0 and item.stdout is defined and item.stdout | length > 0
+      tags: [diagnose]
+
+    # --------------------------------------------------------
+    # Discover listening sockets WITH bind address (not just port)
+    # --------------------------------------------------------
+
+    - name: "STAGE 1 - Discover listening TCP sockets"
+      ansible.builtin.shell: "ss -lntp 2>/dev/null"
+      register: listening_sockets
+      changed_when: false
+      tags: [diagnose]
+
+    - name: "STAGE 1 - Extract local address:port tokens"
+      ansible.builtin.set_fact:
+        discovered_bind_targets: >-
+          {{
+            listening_sockets.stdout_lines
+            | default([])
+            | map('regex_findall', '(\[?[0-9a-fA-F:\.\*]+\]?):(\d+)\s')
+            | select
+            | map('first')
+            | list
+            | unique
+          }}
+      tags: [diagnose]
+
+    # Resolve wildcard binds (0.0.0.0 / * / ::) to a loopback address
+    # for probing purposes; keep specific binds as-is.
+    - name: "STAGE 1 - Resolve probe address per bind target"
+      ansible.builtin.set_fact:
+        probe_targets: >-
+          {{
+            probe_targets | default([]) + [{
+              'address': (
+                '127.0.0.1' if item[0] in ['0.0.0.0', '*']
+                else '::1' if item[0] in ['::', '[::]']
+                else item[0] | regex_replace('^\[|\]$', '')
+              ),
+              'port': item[1] | int
+            }]
+          }}
+      loop: "{{ discovered_bind_targets }}"
+      tags: [diagnose]
+
+    # --------------------------------------------------------
+    # Discover SNI hostnames from nginx/apache configs, so we
+    # probe with the actual vhost name(s) instead of "localhost"
+    # --------------------------------------------------------
+
+    - name: "STAGE 1 - Discover configured server names (nginx)"
+      ansible.builtin.shell: |
+        grep -rhoE 'server_name\s+[^;]+;' /etc/nginx 2>/dev/null \
+          | sed -E 's/server_name\s+//; s/;\s*$//' || true
+      register: nginx_server_names
+      changed_when: false
+      failed_when: false
+      tags: [diagnose]
+
+    - name: "STAGE 1 - Discover configured server names (apache)"
+      ansible.builtin.shell: |
+        grep -rhoE 'ServerName\s+\S+' /etc/apache2 /etc/httpd 2>/dev/null \
+          | awk '{print $2}' || true
+      register: apache_server_names
+      changed_when: false
+      failed_when: false
+      tags: [diagnose]
+
+    - name: "STAGE 1 - Build unique discovered hostname list"
+      ansible.builtin.set_fact:
+        discovered_hostnames: >-
+          {{
+            (
+              (nginx_server_names.stdout_lines | default([]) | map('trim') | list)
+              + (apache_server_names.stdout_lines | default([]) | map('trim') | list)
+            )
+            | select('match', '^[^\s\*]+$')
+            | reject('equalto', '')
+            | unique
+            | list
+          }}
+      tags: [diagnose]
+
+    # --------------------------------------------------------
+    # Probe every (address, port) target - STARTTLS-aware,
+    # SNI-aware. Falls back to no-SNI / implicit TLS when no
+    # hostname was discovered or the port isn't a STARTTLS port.
+    # --------------------------------------------------------
+
+    - name: "STAGE 1 - Probe discovered targets for TLS"
+      ansible.builtin.shell: |
+        set -o pipefail
+        ADDR="{{ item.0.address }}"
+        PORT="{{ item.0.port }}"
+        SNI="{{ item.1 | default('') }}"
+        STARTTLS_PROTO="{{ (starttls_port_map | selectattr('port', 'equalto', item.0.port) | map(attribute='protocol') | first) | default('') }}"
+
+        SNI_ARGS=""
+        if [ -n "$SNI" ]; then
+          SNI_ARGS="-servername $SNI"
+        fi
+
+        STARTTLS_ARGS=""
+        if [ -n "$STARTTLS_PROTO" ]; then
+          STARTTLS_ARGS="-starttls $STARTTLS_PROTO"
+        fi
+
+        timeout {{ tls_probe_timeout }} openssl s_client \
+          -connect "$ADDR:$PORT" \
+          $SNI_ARGS $STARTTLS_ARGS \
+          </dev/null 2>/dev/null | \
+        openssl x509 -noout -subject -issuer -serial -fingerprint -enddate 2>/dev/null
+      args:
+        executable: /bin/bash
+      loop: "{{ probe_targets | default([]) | product(discovered_hostnames | default(['']) ) | list }}"
+      register: tls_probe_results
+      changed_when: false
+      failed_when: false
+      tags: [diagnose]
+
+
+    - name: "STAGE 1 - Build TLS endpoint records"
+      ansible.builtin.set_fact:
+        discovered_tls_endpoints: >-
+          {{
+            discovered_tls_endpoints + [{
+              'address': item.item.0.address,
+              'port': item.item.0.port,
+              'sni_used': item.item.1 | default(''),
+              'subject': (item.stdout_lines | select('match', '^subject=') | first | default('')),
+              'issuer': (item.stdout_lines | select('match', '^issuer=') | first | default('')),
+              'serial': (item.stdout_lines | select('match', '^serial=') | first | default('')),
+              'fingerprint': (item.stdout_lines | select('match', '^SHA256 Fingerprint=') | first | default('')),
+              'not_after': (item.stdout_lines | select('match', '^notAfter=') | first | default(''))
+            }]
+          }}
+      loop: "{{ tls_probe_results.results }}"
+      when:
+        - item.rc == 0
+        - item.stdout is defined
+        - item.stdout_lines | select('match', '^subject=') | list | length > 0
+      tags: [diagnose]
+
+    # --------------------------------------------------------
+    # Certbot detection
+    # --------------------------------------------------------
+
+    - name: "STAGE 1 - Detect Certbot"
+      ansible.builtin.command: "which certbot"
+      register: certbot_binary
+      changed_when: false
+      failed_when: false
+      tags: [diagnose]
+
+    - name: "STAGE 1 - Discover Certbot certificates"
+      ansible.builtin.command: "certbot certificates"
+      register: certbot_certificates
+      changed_when: false
+      failed_when: false
+      when: certbot_binary.rc == 0
+      tags: [diagnose]
+
+    - name: "STAGE 1 - Determine certificate renewal method"
+      ansible.builtin.set_fact:
+        certificate_renewal_method: >-
+          {{
+            'certbot'
+            if (certbot_binary.rc == 0 and certbot_certificates.stdout is defined
+                and (discovered_certificates | selectattr('path', 'search', '/etc/letsencrypt/') | list | length) > 0)
+            else 'unknown'
+          }}
+      tags: [diagnose]
+
+    # --------------------------------------------------------
+    # Overall diagnosis
+    # --------------------------------------------------------
+
+    - name: "STAGE 1 - Determine certificate health"
+      ansible.builtin.set_fact:
+        certificate_diagnosis_status: >-
+          {{
+            'CRITICAL'
+            if (discovered_certificates | selectattr('status', 'in', ['EXPIRED', 'CRITICAL']) | list | length) > 0
+            else 'WARNING'
+            if (discovered_certificates | selectattr('status', 'equalto', 'EXPIRING_SOON') | list | length) > 0
+            else 'HEALTHY'
+          }}
+      tags: [diagnose]
+
+    - name: "STAGE 1 - Build human-readable diagnosis report"
+      ansible.builtin.set_fact:
+        certificate_diagnosis_report: |-
+          ============================================================
+           PiQuickHeal TLS/SSL Certificate Diagnosis - {{ inventory_hostname }}
+           Overall Status: {{ certificate_diagnosis_status }}
+          ============================================================
+          Policy:                        warn <= {{ certificate_warning_days }}d, critical <= {{ certificate_critical_days }}d
+          Certificates found:            {{ discovered_certificates | length }}
+          TLS endpoints probed (live):   {{ discovered_tls_endpoints | length }}
+          Renewal method detected:       {{ certificate_renewal_method }}
+          Certbot present:               {{ certbot_binary.rc == 0 }}
+
+          ------------------------------------------------------------
+          CERTIFICATES NEEDING ATTENTION ({{ discovered_certificates | rejectattr('status', 'equalto', 'HEALTHY') | list | length }} of {{ discovered_certificates | length }})
+          ------------------------------------------------------------
+          {% set attention_certs = discovered_certificates | rejectattr('status', 'equalto', 'HEALTHY') | sort(attribute='days_remaining') | list %}
+          {% if attention_certs | length == 0 %}
+          (none - every discovered certificate is HEALTHY)
+          {% else %}
+          {% for cert in attention_certs %}
+          [{{ '%-13s' | format(cert.status) }}] {{ cert.path }}  (chain {{ cert.chain_index }}/{{ cert.chain_total }}, {{ cert.role }})
+              Subject:  {{ cert.subject }}
+              Issuer:   {{ cert.issuer }}
+              Expires:  {{ cert.not_after }}   ({{ cert.days_remaining }} days remaining)
+          {% endfor %}
+          {% endif %}
+
+          {{ discovered_certificates | selectattr('status', 'equalto', 'HEALTHY') | list | length }} other certificate(s) are HEALTHY (> {{ certificate_warning_days }} days remaining) and are omitted above for brevity.
+          ------------------------------------------------------------
+          TLS ENDPOINTS (live probes)
+          ------------------------------------------------------------
+          {% if discovered_tls_endpoints | length == 0 %}
+          (none found / none responded)
+          {% else %}
+          {% for ep in discovered_tls_endpoints %}
+          {{ ep.address }}:{{ ep.port }}{% if ep.sni_used %} (sni: {{ ep.sni_used }}){% endif %}
+
+              Subject:  {{ ep.subject | regex_replace('^subject=', '') }}
+              Expires:  {{ ep.not_after | regex_replace('^notAfter=', '') }}
+          {% endfor %}
+          {% endif %}
+          ============================================================
+      tags: [diagnose]
+
+    - name: "DISPLAY DIAGNOSIS OUTPUT"
+      ansible.builtin.debug:
+        msg: "{{ certificate_diagnosis_report.split('\n') }}"
+      tags: [diagnose]
+
+    - name: "PUBLISH DIAGNOSIS"
+      ansible.builtin.set_stats:
+        data:
+          piquickheal_issue: "tls_certificate_rotation"
+          piquickheal_stage: "diagnose"
+          piquickheal_status: "{{ certificate_diagnosis_status }}"
+          certificate_count: "{{ discovered_certificates | length }}"
+          tls_endpoint_count: "{{ discovered_tls_endpoints | length }}"
+          renewal_method: "{{ certificate_renewal_method }}"
+          certificates: "{{ discovered_certificates }}"
+          tls_endpoints: "{{ discovered_tls_endpoints }}"
+          diagnosis_report: "{{ certificate_diagnosis_report }}"
+      tags: [diagnose]
+
+    # ========================================================
+    # STAGE 2 - REMEDIATION
+    # (only auto-renews certbot-managed certs; everything else
+    # falls to MANUAL_ACTION_REQUIRED)
+    # ========================================================
+
+    - name: "STAGE 2 - Check Certbot availability"
+      ansible.builtin.command: "which certbot"
+      register: remediation_certbot
+      changed_when: false
+      failed_when: false
+      tags: [remediate]
+
+    - name: "STAGE 2 - Get Certbot certificate inventory"
+      ansible.builtin.command: "certbot certificates"
+      register: remediation_certbot_inventory
+      changed_when: false
+      failed_when: false
+      when: remediation_certbot.rc == 0
+      tags: [remediate]
+
+    - name: "STAGE 2 - Determine whether Certbot can be used"
+      ansible.builtin.set_fact:
+        certbot_renewal_possible: >-
+          {{
+            true
+            if (remediation_certbot.rc == 0 and remediation_certbot_inventory.stdout is defined
+                and '/etc/letsencrypt/' in remediation_certbot_inventory.stdout)
+            else false
+          }}
+      tags: [remediate]
+
+    - name: "STAGE 2 - Renew certificates using detected Certbot"
+      ansible.builtin.command: "certbot renew --non-interactive"
+      register: certbot_renew_result
+      changed_when: "'No renewals were attempted' not in certbot_renew_result.stdout"
+      failed_when: false
+      when:
+        - allow_certbot_renewal | bool
+        - certbot_renewal_possible | bool
+      tags: [remediate]
+
+    - name: "STAGE 2 - Flag unknown certificate renewal mechanism"
+      ansible.builtin.set_fact:
+        certificate_manual_action_required: true
+      when: not (certbot_renewal_possible | default(false) | bool)
+      tags: [remediate]
+
+    - name: "STAGE 2 - Display manual remediation requirement"
+      ansible.builtin.debug:
+        msg:
+          status: "MANUAL_ACTION_REQUIRED"
+          reason: "Certificate renewal mechanism could not be safely identified (not Certbot-managed)."
+      when: certificate_manual_action_required | default(false) | bool
+      tags: [remediate]
+
+    - name: "STAGE 2 - Determine remediation result"
+      ansible.builtin.set_fact:
+        certificate_remediation_status: "{{ 'RENEWAL_ATTEMPTED' if certbot_renewal_possible | default(false) | bool else 'MANUAL_ACTION_REQUIRED' }}"
+      tags: [remediate]
+
+    - name: "DISPLAY REMEDIATION OUTPUT"
+      ansible.builtin.debug:
+        msg:
+          remediation_status: "{{ certificate_remediation_status }}"
+          certbot_renewal_possible: "{{ certbot_renewal_possible | default(false) }}"
+          certbot_output: "{{ certbot_renew_result.stdout if certbot_renew_result is defined else 'Not executed' }}"
+      tags: [remediate]
+
+    - name: "PUBLISH REMEDIATION OUTPUT"
+      ansible.builtin.set_stats:
+        data:
+          piquickheal_issue: "tls_certificate_rotation"
+          piquickheal_stage: "remediate"
+          piquickheal_status: "{{ certificate_remediation_status }}"
+          manual_action_required: "{{ certificate_manual_action_required | default(false) }}"
+          certbot_output: "{{ certbot_renew_result.stdout if certbot_renew_result is defined else '' }}"
+      tags: [remediate]
+
+    # ========================================================
+    # STAGE 3 - VALIDATION
+    # (re-probes using the same address/SNI/STARTTLS-aware logic
+    # as diagnosis, so validation checks what diagnosis checked)
+    # ========================================================
+
+    - name: "STAGE 3 - Rediscover listening sockets"
+      ansible.builtin.shell: "ss -lntp 2>/dev/null"
+      register: validation_listening_sockets
+      changed_when: false
+      failed_when: false
+      tags: [validate]
+
+    - name: "STAGE 3 - Extract validation bind targets"
+      ansible.builtin.set_fact:
+        validation_bind_targets: >-
+          {{
+            validation_listening_sockets.stdout_lines
+            | default([])
+            | map('regex_findall', '(\[?[0-9a-fA-F:\.\*]+\]?):(\d+)\s')
+            | select
+            | map('first')
+            | list
+            | unique
+          }}
+      tags: [validate]
+
+    - name: "STAGE 3 - Resolve validation probe addresses"
+      ansible.builtin.set_fact:
+        validation_probe_targets: >-
+          {{
+            validation_probe_targets | default([]) + [{
+              'address': ('127.0.0.1' if item[0] in ['0.0.0.0', '*'] else '::1' if item[0] in ['::', '[::]'] else item[0] | regex_replace('^\[|\]$', '')),
+              'port': item[1] | int
+            }]
+          }}
+      loop: "{{ validation_bind_targets }}"
+      tags: [validate]
+
+    - name: "STAGE 3 - Validate TLS endpoints (STARTTLS/SNI-aware)"
+      ansible.builtin.shell: |
+        set -o pipefail
+        ADDR="{{ item.0.address }}"; PORT="{{ item.0.port }}"; SNI="{{ item.1 | default('') }}"
+        STARTTLS_PROTO="{{ (starttls_port_map | selectattr('port', 'equalto', item.0.port) | map(attribute='protocol') | first) | default('') }}"
+        SNI_ARGS=""; [ -n "$SNI" ] && SNI_ARGS="-servername $SNI"
+        STARTTLS_ARGS=""; [ -n "$STARTTLS_PROTO" ] && STARTTLS_ARGS="-starttls $STARTTLS_PROTO"
+        timeout {{ tls_probe_timeout }} openssl s_client -connect "$ADDR:$PORT" $SNI_ARGS $STARTTLS_ARGS </dev/null 2>/dev/null | \
+        openssl x509 -noout -subject -issuer -serial -fingerprint -enddate 2>/dev/null
+      args:
+        executable: /bin/bash
+      loop: "{{ validation_probe_targets | default([]) | product(discovered_hostnames | default(['']) ) | list }}"
+      register: validation_tls_results
+      changed_when: false
+      failed_when: false
+      tags: [validate]
+
+    - name: "STAGE 3 - Build TLS validation records"
+      ansible.builtin.set_fact:
+        validation_tls_endpoints: >-
+          {{
+            validation_tls_endpoints | default([]) + [{
+              'address': item.item.0.address,
+              'port': item.item.0.port,
+              'sni_used': item.item.1 | default(''),
+              'subject': (item.stdout_lines | select('match', '^subject=') | first | default('')),
+              'not_after': (item.stdout_lines | select('match', '^notAfter=') | first | default('')),
+              'tls_status': 'HEALTHY' if (item.rc == 0 and (item.stdout_lines | select('match', '^subject=') | list | length) > 0) else 'FAILED'
+            }]
+          }}
+      loop: "{{ validation_tls_results.results }}"
+      tags: [validate]
+
+    - name: "STAGE 3 - Determine final certificate health"
+      ansible.builtin.set_fact:
+        certificate_validation_status: >-
+          {{
+            'FAILED'
+            if (validation_tls_endpoints | default([]) | selectattr('tls_status', 'equalto', 'FAILED') | list | length) > 0
+            else 'VALIDATED'
+          }}
+      tags: [validate]
+
+    - name: "RECORD HEAL RESULT - ensure log directory"
+      ansible.builtin.file:
+        path: "{{ piquickheal_log_directory }}"
+        state: directory
+        mode: "0750"
+      tags: [validate]
+
+    - name: "STAGE 3 - Write certificate heal log"
+      ansible.builtin.lineinfile:
+        path: "{{ piquickheal_log_file }}"
+        create: true
+        mode: "0640"
+        line: >-
+          {{ ansible_date_time.iso8601 }} host={{ inventory_hostname }} issue=tls_certificate_rotation
+          validation={{ certificate_validation_status }}
+          tls_endpoints={{ validation_tls_endpoints | default([]) | to_json }}
+      tags: [validate]
+
+    - name: "FINAL RESULT"
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          issue: "tls_certificate_rotation"
+          validation_status: "{{ certificate_validation_status }}"
+          tls_endpoints: "{{ validation_tls_endpoints | default([]) }}"
+          remediation:
+            certbot_used: "{{ certbot_renewal_possible | default(false) }}"
+            manual_action_required: "{{ certificate_manual_action_required | default(false) }}"
+      tags: [validate]
+
+    - name: "PUBLISH FINAL RESULT"
+      ansible.builtin.set_stats:
+        data:
+          piquickheal_issue: "tls_certificate_rotation"
+          piquickheal_stage: "validate"
+          piquickheal_status: "{{ certificate_validation_status }}"
+          validation_result: "{{ validation_tls_endpoints | default([]) }}"
+          remediation_status: "{{ certificate_remediation_status | default('NOT_RUN') }}"
+          manual_action_required: "{{ certificate_manual_action_required | default(false) }}"
+      tags: [validate]
