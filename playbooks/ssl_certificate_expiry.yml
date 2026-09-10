@@ -105,6 +105,281 @@
     tls_inspector_path: /tmp/piquickheal_tls_inspect.py
 
     # --------------------------------------------------------
+    # Inspector source, deployed to the target in STAGE 4 and
+    # again in STAGE 24.
+    #
+    # !unsafe keeps Jinja away from the script body.
+    # --------------------------------------------------------
+
+    tls_inspector_source: !unsafe |
+      #!/usr/bin/env python3
+      """
+      PiQuickHeal TLS certificate inspector.
+
+      Reads a newline-delimited list of candidate certificate file paths on stdin,
+      inspects every certificate found in each file, and writes a single JSON
+      document to stdout.
+
+      One `openssl x509` invocation per certificate (not per attribute), so a
+      150-certificate CA bundle costs 150 subprocesses instead of ~1200.
+      """
+
+      import calendar
+      import json
+      import os
+      import re
+      import subprocess
+      import sys
+      import time
+
+      PEM_BLOCK = re.compile(
+          rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+          re.DOTALL,
+      )
+
+      OPENSSL_ARGS = [
+          "-noout",
+          "-nameopt", "rfc2253",
+          "-subject",
+          "-issuer",
+          "-serial",
+          "-fingerprint", "-sha256",
+          "-startdate",
+          "-enddate",
+          "-ext", "basicConstraints,subjectAltName",
+      ]
+
+      MONTHS = {
+          "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+          "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+      }
+
+      PROVIDER_PATTERNS = [
+          ("LETS_ENCRYPT", ("let's encrypt", "lets encrypt")),
+          ("DIGICERT", ("digicert",)),
+          ("GODADDY", ("godaddy",)),
+          ("SECTIGO_COMODO", ("sectigo", "comodo")),
+          ("GLOBALSIGN", ("globalsign",)),
+          ("ENTRUST", ("entrust",)),
+          ("AMAZON_ACM", ("amazon", "aws")),
+          ("GOOGLE_TRUST", ("google trust",)),
+          ("ZEROSSL", ("zerossl",)),
+      ]
+
+
+      def run_openssl(payload, inform):
+          """Return openssl -text-ish attribute output for one certificate."""
+          cmd = ["openssl", "x509", "-inform", inform] + OPENSSL_ARGS
+          try:
+              proc = subprocess.run(
+                  cmd,
+                  input=payload,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.DEVNULL,
+                  timeout=15,
+              )
+          except (OSError, subprocess.TimeoutExpired):
+              return None
+          if proc.returncode != 0:
+              return None
+          return proc.stdout.decode("utf-8", "replace")
+
+
+      def parse_openssl_date(value):
+          """Parse 'Feb  1 00:00:00 2020 GMT' without shelling out to date(1)."""
+          if not value:
+              return None
+          parts = value.replace("GMT", "").split()
+          if len(parts) < 4:
+              return None
+          try:
+              month = MONTHS[parts[0][:3]]
+              day = int(parts[1])
+              clock = parts[2].split(":")
+              year = int(parts[3])
+              hour, minute, second = (int(clock[0]), int(clock[1]), int(clock[2]))
+          except (KeyError, ValueError, IndexError):
+              return None
+          # X.509 notBefore/notAfter are UTC. timegm() converts a UTC struct
+          # directly, so the result does not depend on the host time zone.
+          try:
+              return int(
+                  calendar.timegm((year, month, day, hour, minute, second, 0, 1, -1))
+              )
+          except (OverflowError, ValueError):
+              return None
+
+
+      def parse_attributes(text):
+          """Turn openssl attribute output into a flat dict."""
+          out = {
+              "subject": "",
+              "issuer": "",
+              "serial": "",
+              "fingerprint": "",
+              "not_before": "",
+              "not_after": "",
+              "san": "",
+              "is_ca": False,
+          }
+          lines = text.splitlines()
+          for index, line in enumerate(lines):
+              stripped = line.strip()
+              if line.startswith("subject="):
+                  out["subject"] = line.split("=", 1)[1].strip()
+              elif line.startswith("issuer="):
+                  out["issuer"] = line.split("=", 1)[1].strip()
+              elif line.startswith("serial="):
+                  out["serial"] = line.split("=", 1)[1].strip()
+              elif "Fingerprint=" in line:
+                  out["fingerprint"] = line.split("=", 1)[1].strip()
+              elif line.startswith("notBefore="):
+                  out["not_before"] = line.split("=", 1)[1].strip()
+              elif line.startswith("notAfter="):
+                  out["not_after"] = line.split("=", 1)[1].strip()
+              elif "Basic Constraints" in line:
+                  window = " ".join(lines[index:index + 3]).upper()
+                  if "CA:TRUE" in window:
+                      out["is_ca"] = True
+              elif stripped.startswith(("DNS:", "IP Address:", "email:", "URI:")):
+                  existing = out["san"]
+                  out["san"] = (existing + " " + stripped).strip() if existing else stripped
+          return out
+
+
+      def detect_provider(issuer, self_signed):
+          lowered = issuer.lower()
+          for name, needles in PROVIDER_PATTERNS:
+              for needle in needles:
+                  if needle in lowered:
+                      return name
+          if self_signed:
+              return "SELF_SIGNED"
+          return "UNKNOWN"
+
+
+      def classify(days_remaining, critical_days, warning_days):
+          if days_remaining is None:
+              return "UNPARSEABLE"
+          if days_remaining < 0:
+              return "EXPIRED"
+          if days_remaining <= critical_days:
+              return "CRITICAL"
+          if days_remaining <= warning_days:
+              return "EXPIRING_SOON"
+          return "HEALTHY"
+
+
+      def read_blocks(path, max_certs):
+          """Return (blocks, total_found) for one file, honouring max_certs."""
+          try:
+              with open(path, "rb") as handle:
+                  raw = handle.read()
+          except OSError:
+              return [], 0
+
+          blocks = PEM_BLOCK.findall(raw)
+          if blocks:
+              payloads = [(block + b"\n", "PEM") for block in blocks[:max_certs]]
+              return payloads, len(blocks)
+          if raw[:1] == b"\x30":
+              return [(raw, "DER")], 1
+          return [], 0
+
+
+      def main():
+          critical_days = int(os.environ.get("TLS_CRITICAL_DAYS", "7"))
+          warning_days = int(os.environ.get("TLS_WARNING_DAYS", "30"))
+          max_certs = int(os.environ.get("TLS_MAX_CERTS_PER_FILE", "50"))
+
+          now = int(time.time())
+          records = []
+          skipped = []
+
+          paths = [line.strip() for line in sys.stdin if line.strip()]
+
+          for path in paths:
+              if not os.path.isfile(path) or not os.access(path, os.R_OK):
+                  skipped.append({"path": path, "reason": "UNREADABLE"})
+                  continue
+
+              blocks, total = read_blocks(path, max_certs)
+              if not blocks:
+                  skipped.append({"path": path, "reason": "NOT_A_CERTIFICATE"})
+                  continue
+
+              if total > len(blocks):
+                  skipped.append(
+                      {
+                          "path": path,
+                          "reason": "TRUNCATED",
+                          "found": total,
+                          "inspected": len(blocks),
+                      }
+                  )
+              for index, (payload, inform) in enumerate(blocks, start=1):
+                  text = run_openssl(payload, inform)
+                  if text is None:
+                      skipped.append(
+                          {
+                              "path": path,
+                              "reason": "UNPARSEABLE",
+                              "chain_index": index,
+                          }
+                      )
+                      continue
+
+                  attrs = parse_attributes(text)
+                  end_epoch = parse_openssl_date(attrs["not_after"])
+
+                  if end_epoch is None:
+                      days_remaining = None
+                  else:
+                      days_remaining = (end_epoch - now) // 86400
+
+                  self_signed = bool(
+                      attrs["subject"] and attrs["subject"] == attrs["issuer"]
+                  )
+
+                  records.append(
+                      {
+                          "path": path,
+                          "format": inform,
+                          "chain_index": index,
+                          "chain_total": total,
+                          "subject": attrs["subject"],
+                          "issuer": attrs["issuer"],
+                          "serial": attrs["serial"],
+                          "fingerprint": attrs["fingerprint"],
+                          "not_before": attrs["not_before"],
+                          "not_after": attrs["not_after"],
+                          "days_remaining": days_remaining,
+                          "status": classify(days_remaining, critical_days, warning_days),
+                          "is_ca": attrs["is_ca"],
+                          "self_signed": self_signed,
+                          "provider": detect_provider(attrs["issuer"], self_signed),
+                          "san": attrs["san"],
+                          "is_bundle": total > 1,
+                      }
+                  )
+
+          json.dump(
+              {
+                  "generated_at": now,
+                  "candidate_count": len(paths),
+                  "record_count": len(records),
+                  "records": records,
+                  "skipped": skipped,
+              },
+              sys.stdout,
+          )
+          sys.stdout.write("\n")
+
+
+      if __name__ == "__main__":
+          main()
+
+    # --------------------------------------------------------
     # Certificate discovery paths
     #
     # These are roots, not individual certificate files.
@@ -167,6 +442,13 @@
       - "tls-ca-bundle.pem"
       - "email-ca-bundle.pem"
       - "objsign-ca-bundle.pem"
+
+      # fwupd firmware-signing CAs. These verify firmware
+      # metadata signatures, not TLS. They are long-lived
+      # (2047 and 2060), they are present on every RHEL host,
+      # and they inflate the CA count on every scan.
+      - "/fwupd/"
+      - "/fwupd-metadata/"
 
     # --------------------------------------------------------
     # Certificate extensions
@@ -421,273 +703,7 @@
         mode: "0700"
         owner: root
         group: root
-        content: |
-          #!/usr/bin/env python3
-          """
-          PiQuickHeal TLS certificate inspector.
-
-          Reads a newline-delimited list of candidate certificate file paths on stdin,
-          inspects every certificate found in each file, and writes a single JSON
-          document to stdout.
-
-          One `openssl x509` invocation per certificate (not per attribute), so a
-          150-certificate CA bundle costs 150 subprocesses instead of ~1200.
-          """
-
-          import calendar
-          import json
-          import os
-          import re
-          import subprocess
-          import sys
-          import time
-
-          PEM_BLOCK = re.compile(
-              rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
-              re.DOTALL,
-          )
-
-          OPENSSL_ARGS = [
-              "-noout",
-              "-nameopt", "rfc2253",
-              "-subject",
-              "-issuer",
-              "-serial",
-              "-fingerprint", "-sha256",
-              "-startdate",
-              "-enddate",
-              "-ext", "basicConstraints,subjectAltName",
-          ]
-
-          MONTHS = {
-              "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
-              "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
-          }
-
-          PROVIDER_PATTERNS = [
-              ("LETS_ENCRYPT", ("let's encrypt", "lets encrypt")),
-              ("DIGICERT", ("digicert",)),
-              ("GODADDY", ("godaddy",)),
-              ("SECTIGO_COMODO", ("sectigo", "comodo")),
-              ("GLOBALSIGN", ("globalsign",)),
-              ("ENTRUST", ("entrust",)),
-              ("AMAZON_ACM", ("amazon", "aws")),
-              ("GOOGLE_TRUST", ("google trust",)),
-              ("ZEROSSL", ("zerossl",)),
-          ]
-
-
-          def run_openssl(payload, inform):
-              """Return openssl -text-ish attribute output for one certificate."""
-              cmd = ["openssl", "x509", "-inform", inform] + OPENSSL_ARGS
-              try:
-                  proc = subprocess.run(
-                      cmd,
-                      input=payload,
-                      stdout=subprocess.PIPE,
-                      stderr=subprocess.DEVNULL,
-                      timeout=15,
-                  )
-              except (OSError, subprocess.TimeoutExpired):
-                  return None
-              if proc.returncode != 0:
-                  return None
-              return proc.stdout.decode("utf-8", "replace")
-
-
-          def parse_openssl_date(value):
-              """Parse 'Feb  1 00:00:00 2020 GMT' without shelling out to date(1)."""
-              if not value:
-                  return None
-              parts = value.replace("GMT", "").split()
-              if len(parts) < 4:
-                  return None
-              try:
-                  month = MONTHS[parts[0][:3]]
-                  day = int(parts[1])
-                  clock = parts[2].split(":")
-                  year = int(parts[3])
-                  hour, minute, second = (int(clock[0]), int(clock[1]), int(clock[2]))
-              except (KeyError, ValueError, IndexError):
-                  return None
-              # X.509 notBefore/notAfter are UTC. timegm() converts a UTC struct
-              # directly, so the result does not depend on the host time zone.
-              try:
-                  return int(
-                      calendar.timegm((year, month, day, hour, minute, second, 0, 1, -1))
-                  )
-              except (OverflowError, ValueError):
-                  return None
-
-
-          def parse_attributes(text):
-              """Turn openssl attribute output into a flat dict."""
-              out = {
-                  "subject": "",
-                  "issuer": "",
-                  "serial": "",
-                  "fingerprint": "",
-                  "not_before": "",
-                  "not_after": "",
-                  "san": "",
-                  "is_ca": False,
-              }
-              lines = text.splitlines()
-              for index, line in enumerate(lines):
-                  stripped = line.strip()
-                  if line.startswith("subject="):
-                      out["subject"] = line.split("=", 1)[1].strip()
-                  elif line.startswith("issuer="):
-                      out["issuer"] = line.split("=", 1)[1].strip()
-                  elif line.startswith("serial="):
-                      out["serial"] = line.split("=", 1)[1].strip()
-                  elif "Fingerprint=" in line:
-                      out["fingerprint"] = line.split("=", 1)[1].strip()
-                  elif line.startswith("notBefore="):
-                      out["not_before"] = line.split("=", 1)[1].strip()
-                  elif line.startswith("notAfter="):
-                      out["not_after"] = line.split("=", 1)[1].strip()
-                  elif "Basic Constraints" in line:
-                      window = " ".join(lines[index:index + 3]).upper()
-                      if "CA:TRUE" in window:
-                          out["is_ca"] = True
-                  elif stripped.startswith(("DNS:", "IP Address:", "email:", "URI:")):
-                      existing = out["san"]
-                      out["san"] = (existing + " " + stripped).strip() if existing else stripped
-              return out
-
-
-          def detect_provider(issuer, self_signed):
-              lowered = issuer.lower()
-              for name, needles in PROVIDER_PATTERNS:
-                  for needle in needles:
-                      if needle in lowered:
-                          return name
-              if self_signed:
-                  return "SELF_SIGNED"
-              return "UNKNOWN"
-
-
-          def classify(days_remaining, critical_days, warning_days):
-              if days_remaining is None:
-                  return "UNPARSEABLE"
-              if days_remaining < 0:
-                  return "EXPIRED"
-              if days_remaining <= critical_days:
-                  return "CRITICAL"
-              if days_remaining <= warning_days:
-                  return "EXPIRING_SOON"
-              return "HEALTHY"
-
-
-          def read_blocks(path, max_certs):
-              """Return (blocks, total_found) for one file, honouring max_certs."""
-              try:
-                  with open(path, "rb") as handle:
-                      raw = handle.read()
-              except OSError:
-                  return [], 0
-
-              blocks = PEM_BLOCK.findall(raw)
-              if blocks:
-                  payloads = [(block + b"\n", "PEM") for block in blocks[:max_certs]]
-                  return payloads, len(blocks)
-              if raw[:1] == b"\x30":
-                  return [(raw, "DER")], 1
-              return [], 0
-
-
-          def main():
-              critical_days = int(os.environ.get("TLS_CRITICAL_DAYS", "7"))
-              warning_days = int(os.environ.get("TLS_WARNING_DAYS", "30"))
-              max_certs = int(os.environ.get("TLS_MAX_CERTS_PER_FILE", "50"))
-
-              now = int(time.time())
-              records = []
-              skipped = []
-
-              paths = [line.strip() for line in sys.stdin if line.strip()]
-
-              for path in paths:
-                  if not os.path.isfile(path) or not os.access(path, os.R_OK):
-                      skipped.append({"path": path, "reason": "UNREADABLE"})
-                      continue
-
-                  blocks, total = read_blocks(path, max_certs)
-                  if not blocks:
-                      skipped.append({"path": path, "reason": "NOT_A_CERTIFICATE"})
-                      continue
-
-                  if total > len(blocks):
-                      skipped.append(
-                          {
-                              "path": path,
-                              "reason": "TRUNCATED",
-                              "found": total,
-                              "inspected": len(blocks),
-                          }
-                      )
-                  for index, (payload, inform) in enumerate(blocks, start=1):
-                      text = run_openssl(payload, inform)
-                      if text is None:
-                          skipped.append(
-                              {
-                                  "path": path,
-                                  "reason": "UNPARSEABLE",
-                                  "chain_index": index,
-                              }
-                          )
-                          continue
-
-                      attrs = parse_attributes(text)
-                      end_epoch = parse_openssl_date(attrs["not_after"])
-
-                      if end_epoch is None:
-                          days_remaining = None
-                      else:
-                          days_remaining = (end_epoch - now) // 86400
-
-                      self_signed = bool(
-                          attrs["subject"] and attrs["subject"] == attrs["issuer"]
-                      )
-
-                      records.append(
-                          {
-                              "path": path,
-                              "format": inform,
-                              "chain_index": index,
-                              "chain_total": total,
-                              "subject": attrs["subject"],
-                              "issuer": attrs["issuer"],
-                              "serial": attrs["serial"],
-                              "fingerprint": attrs["fingerprint"],
-                              "not_before": attrs["not_before"],
-                              "not_after": attrs["not_after"],
-                              "days_remaining": days_remaining,
-                              "status": classify(days_remaining, critical_days, warning_days),
-                              "is_ca": attrs["is_ca"],
-                              "self_signed": self_signed,
-                              "provider": detect_provider(attrs["issuer"], self_signed),
-                              "san": attrs["san"],
-                              "is_bundle": total > 1,
-                          }
-                      )
-
-              json.dump(
-                  {
-                      "generated_at": now,
-                      "candidate_count": len(paths),
-                      "record_count": len(records),
-                      "records": records,
-                      "skipped": skipped,
-                  },
-                  sys.stdout,
-              )
-              sys.stdout.write("\n")
-
-
-          if __name__ == "__main__":
-              main()
+        content: "{{ tls_inspector_source }}"
       tags:
         - diagnose
         - remediate
@@ -1572,56 +1588,78 @@
 
 
     # ========================================================
-    # STAGE 24 - RE-DISCOVER CERTIFICATES
+    # STAGE 24 - RE-INSPECT CERTIFICATES
     #
-    # This validates the files after remediation.
+    # Re-runs the same inspector used in STAGE 4 so that the
+    # before/after comparison uses identical parsing.
+    #
+    # The previous shell implementation had two of the defects
+    # that were fixed in STAGE 4: it read only the first
+    # certificate in each file, and it fed a possibly empty
+    # notAfter to `date -d`, which resolves to today at
+    # midnight rather than failing.
     # ========================================================
 
-    - name: STAGE 24 - Recheck certificate files
-      ansible.builtin.shell: |
-        set -o pipefail
+    - name: STAGE 24 - Redeploy certificate inspector
+      ansible.builtin.copy:
+        dest: "{{ tls_inspector_path }}"
+        mode: "0700"
+        owner: root
+        group: root
+        content: "{{ tls_inspector_source }}"
+      when: tls_allow_remediation | bool
+      tags:
+        - validate
+        - remediate
 
-        for FILE in {{ tls_certificate_candidates | map('quote') | join(' ') }}; do
 
-          if [ ! -r "$FILE" ]; then
-            continue
-          fi
-
-          if ! openssl x509 -in "$FILE" -noout >/dev/null 2>&1; then
-            continue
-          fi
-
-          NOT_AFTER=$(
-            openssl x509 \
-              -in "$FILE" \
-              -noout \
-              -enddate 2>/dev/null |
-            cut -d= -f2-
-          )
-
-          END_EPOCH=$(
-            date -d "$NOT_AFTER" +%s 2>/dev/null || echo 0
-          )
-
-          NOW_EPOCH=$(date +%s)
-
-          if [ "$END_EPOCH" -gt 0 ]; then
-            DAYS_REMAINING=$(( (END_EPOCH - NOW_EPOCH) / 86400 ))
-          else
-            DAYS_REMAINING=-99999
-          fi
-
-          printf '%s|%s|%s\n' \
-            "$FILE" \
-            "$NOT_AFTER" \
-            "$DAYS_REMAINING"
-
-        done
-      args:
-        executable: /bin/bash
+    - name: STAGE 24 - Re-inspect certificates
+      ansible.builtin.command:
+        cmd: "{{ tls_inspector_path }}"
+        stdin: "{{ tls_certificate_candidates | join('\n') }}"
+      environment:
+        TLS_CRITICAL_DAYS: "{{ tls_expiry_critical_days }}"
+        TLS_WARNING_DAYS: "{{ tls_expiry_warning_days }}"
+        TLS_MAX_CERTS_PER_FILE: "{{ tls_max_certs_per_file }}"
       register: tls_post_remediation_check
       changed_when: false
       failed_when: false
+      when: tls_allow_remediation | bool
+      tags:
+        - validate
+        - remediate
+
+
+    - name: STAGE 24 - Remove certificate inspector
+      ansible.builtin.file:
+        path: "{{ tls_inspector_path }}"
+        state: absent
+      failed_when: false
+      tags:
+        - validate
+        - remediate
+
+
+    - name: STAGE 24 - Parse post-remediation state
+      ansible.builtin.set_fact:
+        tls_post_remediation_records: >-
+          {{
+            (
+              tls_post_remediation_check.stdout
+              | default('')
+              | trim
+              | from_json
+            ).records
+            | default([])
+            if (
+              (tls_post_remediation_check.rc | default(1)) == 0
+              and (
+                tls_post_remediation_check.stdout
+                | default('') | trim | length
+              ) > 0
+            )
+            else []
+          }}
       tags:
         - validate
         - remediate
@@ -1629,17 +1667,43 @@
 
     # ========================================================
     # STAGE 25 - VALIDATION
+    #
+    # Validation now answers "are there still unhealthy leaf
+    # certificates?" rather than "did the recheck command
+    # exit 0?".
+    #
+    # The old check compared the exit status of a shell loop
+    # that could not fail, so it reported PASSED on every run
+    # including runs where remediation never executed and the
+    # expired certificate was untouched.
     # ========================================================
+
+    - name: STAGE 25 - Find remaining unhealthy certificates
+      ansible.builtin.set_fact:
+        tls_remaining_unhealthy: >-
+          {{
+            tls_post_remediation_records
+            | rejectattr('is_ca')
+            | selectattr('status', 'in', ['EXPIRED', 'CRITICAL'])
+            | list
+          }}
+      tags:
+        - validate
+        - remediate
+
 
     - name: STAGE 25 - Determine validation status
       ansible.builtin.set_fact:
         tls_validation_status: >-
           {{
+            'NOT_RUN'
+            if not (tls_allow_remediation | bool)
+            else
+            'NOT_REQUIRED'
+            if not (tls_remediation_required | default(false) | bool)
+            else
             'PASSED'
-            if
-            (
-              tls_post_remediation_check.rc | default(1) == 0
-            )
+            if (tls_remaining_unhealthy | length) == 0
             else
             'FAILED'
           }}
