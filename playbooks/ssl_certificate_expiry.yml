@@ -2,27 +2,6 @@
 # ============================================================
 # PiQuickHeal - Dynamic TLS / SSL Certificate Health
 #
-# Supported execution:
-#
-#   Diagnose:
-#     ansible-playbook tls_certificate_health.yml \
-#       -i inventory \
-#       --tags diagnose
-#
-#   Remediate:
-#     ansible-playbook tls_certificate_health.yml \
-#       -i inventory \
-#       --tags remediate
-#
-#   Validate:
-#     ansible-playbook tls_certificate_health.yml \
-#       -i inventory \
-#       --tags validate
-#
-#   Complete:
-#     ansible-playbook tls_certificate_health.yml \
-#       -i inventory
-#
 # Design:
 #   1. Discover certificates dynamically
 #   2. Parse certificate metadata
@@ -39,41 +18,6 @@
 #   External/unknown certificate providers are detected but
 #   are NOT executed blindly.
 #
-# CHANGELOG (fixes applied after AWX job 84)
-#   - FIXED: STAGE 5 crashed with
-#       AttributeError: 'NoneType' object has no attribute 'group'
-#     Cause: regex_search() was passed the backreference '\\1' from inside a
-#     YAML folded block scalar. Block scalars do not process escapes, so the
-#     filter received a two-character backslash sequence, took the
-#     "starts with a backslash" branch and then failed its own internal
-#     re.match(). The record parsing is now done in one pass with from_json,
-#     so no backreferences are used at all.
-#   - FIXED: STAGE 5 only ever captured the FIRST certificate per file.
-#     regex_search returns a single match, so a 146-certificate CA bundle
-#     produced exactly one record and 145 certificates were silently dropped.
-#   - FIXED: STAGE 12 always produced an empty port list (same backreference
-#     bug, plus select('string') applied to a list), which meant STAGE 14
-#     never probed any endpoint.
-#   - FIXED: false CRITICAL on OpenSSL trusted-certificate files. `date -d ""`
-#     returns today at midnight, so an unparseable notAfter became
-#     days_remaining=0 -> CRITICAL. Unparseable certificates are now reported
-#     as UNPARSEABLE and excluded from the health verdict.
-#   - CHANGED: certificate inspection moved from a nested shell/openssl loop
-#     (about 8 openssl processes per certificate) to a single Python pass with
-#     one openssl invocation per certificate.
-#   - CHANGED: discovery no longer walks the system CA trust store, vendored
-#     Python certifi/botocore bundles, or the fwupd firmware-signing CAs by
-#     default. Set tls_include_trust_stores=true to restore the old behaviour.
-#   - FIXED: STAGE 25 reported PASSED on every run, because it compared the
-#     exit status of a shell loop that could not fail. It now re-inspects and
-#     reports NOT_RUN / NOT_REQUIRED / PASSED / FAILED.
-#   - FIXED: STAGE 21 started .timer units, which only arms the schedule and
-#     never runs the renewal. The matching .service units are now triggered.
-#   - ADDED: STAGE 21B regenerates self-signed leaf certificates, which no
-#     external mechanism can renew. Reuses the existing private key, backs up
-#     the original, and refuses anything it cannot handle confidently. Gated
-#     behind tls_allow_selfsigned_regeneration in addition to
-#     tls_allow_remediation, with a dry-run mode.
 # ============================================================
 
 - name: PiQuickHeal - Dynamic TLS SSL Certificate Health
@@ -87,7 +31,7 @@
     # General settings
     # --------------------------------------------------------
 
-    tls_log_file: "/var/log/piquickheal/tls_certificate_rotation.log"
+    tls_log_file: "/var/log/piquickheal/ssl_certificate_expiry.log"
 
     tls_expiry_critical_days: 7
     tls_expiry_warning_days: 30
@@ -155,6 +99,21 @@
     # Enabled here on request. Set to false to restore the
     # refuse-by-default behaviour.
     tls_selfsigned_allow_new_key: true
+
+    # --------------------------------------------------------
+    # Alerting for certificates the playbook must not touch
+    #
+    # A CA-issued certificate cannot be renewed locally, so the
+    # only correct action is to tell a human. Set this to true
+    # to end the play in a failed state when manual renewal is
+    # needed, which is what AWX notifications trigger on.
+    #
+    # Default false: a diagnosis run that reports a problem has
+    # not itself failed, and failing scheduled scans trains
+    # people to ignore them.
+    # --------------------------------------------------------
+
+    tls_fail_on_manual_action: false
 
     # --------------------------------------------------------
     # Inspector source, deployed to the target in STAGE 4 and
@@ -984,6 +943,8 @@
         tls_regenerated_count: 0
         tls_changes_made: false
 
+        tls_manual_action_certificates: []
+
         tls_post_remediation_records: []
         tls_post_expired_count: 0
         tls_post_critical_count: 0
@@ -1370,6 +1331,28 @@
         - validate
 
 
+    # --------------------------------------------------------
+    # The supported way to force reissuance is to set the
+    # Issuing condition on the Certificate's status, which is
+    # what `kubectl cert-manager renew` does. Detect whether
+    # that plugin is available before relying on it.
+    # --------------------------------------------------------
+
+    - name: STAGE 8 - Detect kubectl cert-manager plugin
+      ansible.builtin.shell: |
+        kubectl cert-manager version --client 2>/dev/null >/dev/null
+      args:
+        executable: /bin/bash
+      register: tls_cert_manager_plugin
+      changed_when: false
+      failed_when: false
+      when: tls_cert_manager_detection.rc == 0
+      tags:
+        - diagnose
+        - remediate
+        - validate
+
+
     - name: STAGE 8 - Detect cert-manager certificates
       ansible.builtin.command:
         cmd: >
@@ -1406,11 +1389,65 @@
         - validate
 
 
-    - name: STAGE 9 - Discover systemd renewal services
+    # --------------------------------------------------------
+    # Renewal services are derived from the discovered timers,
+    # not grepped independently.
+    #
+    # A bare regex on 'cert|ssl|acme|renew' across all service
+    # units matches things that must never be restarted by a
+    # certificate check - sslh.service matches on "ssl" and
+    # restarting it drops every live connection through the
+    # proxy; certmonger.service matches on "cert" and is a
+    # long-running daemon.
+    #
+    # Each timer's Unit= property names the service it drives,
+    # and only Type=oneshot units are kept, so the trigger
+    # cannot restart a daemon.
+    # --------------------------------------------------------
+
+    - name: STAGE 9 - Resolve renewal services from timers
       ansible.builtin.shell: |
-        systemctl list-unit-files --type=service --no-legend 2>/dev/null |
-        awk '{print $1}' |
-        grep -Ei 'cert|ssl|acme|renew' || true
+        set -o pipefail
+
+        for TIMER in {{
+          tls_systemd_timers.stdout_lines
+          | default([])
+          | map('quote')
+          | join(' ')
+        }}; do
+
+          UNIT=$(
+            systemctl show "$TIMER" \
+              --property=Unit \
+              --value 2>/dev/null
+          )
+
+          if [ -z "$UNIT" ]; then
+            UNIT="${TIMER%.timer}.service"
+          fi
+
+          case "$UNIT" in
+            *.service) ;;
+            *) continue ;;
+          esac
+
+          if ! systemctl cat "$UNIT" >/dev/null 2>&1; then
+            continue
+          fi
+
+          TYPE=$(
+            systemctl show "$UNIT" \
+              --property=Type \
+              --value 2>/dev/null
+          )
+
+          # Only oneshot units are safe to trigger. Anything
+          # else is a daemon and restarting it is disruptive.
+          if [ "$TYPE" = "oneshot" ]; then
+            printf '%s\n' "$UNIT"
+          fi
+
+        done | sort -u
       args:
         executable: /bin/bash
       register: tls_systemd_services
@@ -1945,31 +1982,69 @@
         - remediate
 
 
+    # --------------------------------------------------------
+    # The previous implementation set a custom annotation,
+    # piquickheal.io/renew-request. cert-manager does not watch
+    # for that annotation. Writing it bumps resourceVersion and
+    # wakes the controller, but the reconcile then sees a
+    # certificate that is not yet in its renewal window and
+    # correctly does nothing. It looked like remediation and
+    # was effectively a no-op.
+    #
+    # Reissuance is requested through the kubectl cert-manager
+    # plugin, which sets the Issuing status condition. When the
+    # plugin is absent, no substitute is attempted: the
+    # certificates are reported so a human can act, rather than
+    # the play claiming success it did not achieve.
+    # --------------------------------------------------------
+
     - name: STAGE 20 - Request cert-manager renewal
       ansible.builtin.shell: |
         set -o pipefail
+
+        RC=0
 
         while read -r NAMESPACE NAME; do
 
           [ -z "$NAMESPACE" ] && continue
           [ -z "$NAME" ] && continue
 
-          kubectl annotate certificate \
-            "$NAME" \
-            -n "$NAMESPACE" \
-            piquickheal.io/renew-request="$(date +%s)" \
-            --overwrite
+          if ! kubectl cert-manager renew \
+                 "$NAME" \
+                 -n "$NAMESPACE" 2>&1; then
+            RC=1
+          fi
 
         done <<< "{{ tls_cert_manager_certificates.stdout | default('') }}"
+
+        exit "$RC"
       args:
         executable: /bin/bash
       register: tls_cert_manager_renewal
-      changed_when: true
+      changed_when: tls_cert_manager_renewal.rc == 0
       failed_when: false
       when:
         - tls_allow_remediation | bool
         - tls_remediation_required | bool
         - tls_primary_renewal_mechanism == "CERT_MANAGER"
+        - (tls_cert_manager_plugin.rc | default(1)) == 0
+      tags:
+        - remediate
+
+
+    - name: STAGE 20 - Report cert-manager renewal not attempted
+      ansible.builtin.debug:
+        msg:
+          - "cert-manager was detected but renewal was NOT requested."
+          - >-
+            The kubectl cert-manager plugin is not installed on this host, and
+            it is the only supported way to force reissuance. Install it, or
+            run `kubectl cert-manager renew <name> -n <namespace>` from a host
+            that has it.
+          - "{{ tls_cert_manager_certificates.stdout_lines | default([]) }}"
+      when:
+        - tls_primary_renewal_mechanism == "CERT_MANAGER"
+        - (tls_cert_manager_plugin.rc | default(1)) != 0
       tags:
         - remediate
 
@@ -2000,10 +2075,17 @@
         - remediate
 
 
-    - name: STAGE 21 - Trigger detected renewal services
+    # --------------------------------------------------------
+    # `started` rather than `restarted`: these are oneshot
+    # units resolved from the timers, so starting them runs the
+    # renewal. `restarted` would be wrong for anything that
+    # turned out not to be oneshot.
+    # --------------------------------------------------------
+
+    - name: STAGE 21 - Trigger renewal services resolved from timers
       ansible.builtin.systemd:
         name: "{{ item }}"
-        state: restarted
+        state: started
       loop: "{{ tls_systemd_services.stdout_lines | default([]) }}"
       register: tls_systemd_service_run
       failed_when: false
@@ -2158,6 +2240,167 @@
       when: tls_selfsigned_results | length > 0
       tags:
         - remediate
+
+
+    # ========================================================
+    # STAGE 21C - ALERT ON NON-REMEDIABLE CERTIFICATES
+    #
+    # Anything unhealthy that this playbook did not and must
+    # not fix. Two groups end up here:
+    #
+    #   - CA-issued certificates (Let's Encrypt, DigiCert,
+    #     Sectigo, internal PKI and so on). There is no issuer
+    #     available locally to sign a replacement, so a human
+    #     or the issuing workflow has to renew them.
+    #
+    #   - Self-signed certificates that STAGE 21B refused,
+    #     usually because no matching private key was found.
+    #
+    # Certificates regenerated in STAGE 21B are excluded, since
+    # their record still holds the pre-remediation status.
+    # ========================================================
+
+    - name: STAGE 21C - Identify certificates needing manual renewal
+      ansible.builtin.set_fact:
+        tls_manual_action_certificates: >-
+          {{
+            tls_certificate_records
+            | rejectattr('is_ca')
+            | selectattr('status', 'in', ['EXPIRED', 'CRITICAL', 'EXPIRING_SOON'])
+            | rejectattr(
+                'path', 'in',
+                tls_selfsigned_results
+                | default([])
+                | selectattr('action', 'equalto', 'REGENERATED')
+                | map(attribute='path')
+                | list
+              )
+            | list
+          }}
+      tags:
+        - diagnose
+        - remediate
+        - validate
+
+
+    - name: STAGE 21C - Alert header
+      ansible.builtin.debug:
+        msg: >-
+          *** ACTION REQUIRED -
+          {{ tls_manual_action_certificates | length }}
+          certificate(s) cannot be renewed by this playbook ***
+      when: tls_manual_action_certificates | length > 0
+      tags:
+        - diagnose
+        - remediate
+        - validate
+
+
+    - name: STAGE 21C - Alert on certificates needing manual renewal
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.status }}: {{ item.path }}
+          | subject {{ item.subject | default('unknown') }}
+          | issuer {{ item.issuer | default('unknown') }}
+          | provider {{ item.provider | default('UNKNOWN') }}
+          | expires {{ item.not_after | default('unknown') }}
+          ({{ item.days_remaining | default('?') }} days)
+          | {{
+              'renew via the ' ~ (item.provider | default('UNKNOWN')) ~ ' issuing workflow'
+              if item.provider != 'SELF_SIGNED'
+              else
+              'self-signed, regeneration skipped ('
+              ~ (
+                  tls_selfsigned_results | default([])
+                  | selectattr('path', 'equalto', item.path)
+                  | map(attribute='reason') | list | first
+                )
+              ~ ') - resolve that or reissue manually'
+              if (
+                tls_selfsigned_results | default([])
+                | selectattr('path', 'equalto', item.path)
+                | selectattr('reason', 'defined')
+                | list | length
+              ) > 0
+              else
+              'self-signed, automatic regeneration did not run - enable '
+              ~ 'tls_allow_remediation and tls_allow_selfsigned_regeneration, '
+              ~ 'or reissue manually'
+            }}
+      loop: "{{ tls_manual_action_certificates }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: tls_manual_action_certificates | length > 0
+      tags:
+        - diagnose
+        - remediate
+        - validate
+
+
+    - name: STAGE 21C - Add manual renewal recommendations
+      ansible.builtin.set_fact:
+        tls_recommendations: >-
+          {{
+            tls_recommendations
+            + [
+                'ACTION REQUIRED: '
+                ~ item.status
+                ~ ' certificate at ' ~ item.path
+                ~ ' (subject ' ~ (item.subject | default('unknown'))
+                ~ ', issuer ' ~ (item.issuer | default('unknown'))
+                ~ ', provider ' ~ (item.provider | default('UNKNOWN'))
+                ~ ', expires ' ~ (item.not_after | default('unknown'))
+                ~ ', ' ~ (item.days_remaining | default('?'))
+                ~ ' days remaining). '
+                ~ (
+                  'Issued by an external CA. Renew it through the issuing '
+                  ~ 'workflow for ' ~ (item.provider | default('UNKNOWN'))
+                  ~ '; this playbook will not replace a CA-issued '
+                  ~ 'certificate with a self-signed one.'
+                  if item.provider != 'SELF_SIGNED'
+                  else
+                  'Self-signed, and automatic regeneration was skipped ('
+                  ~ (
+                      tls_selfsigned_results | default([])
+                      | selectattr('path', 'equalto', item.path)
+                      | map(attribute='reason') | list | first
+                    )
+                  ~ '). Resolve that or reissue the certificate manually.'
+                  if (
+                    tls_selfsigned_results | default([])
+                    | selectattr('path', 'equalto', item.path)
+                    | selectattr('reason', 'defined')
+                    | list | length
+                  ) > 0
+                  else
+                  'Self-signed, and automatic regeneration did not run. '
+                  ~ 'Enable tls_allow_remediation and '
+                  ~ 'tls_allow_selfsigned_regeneration, or reissue manually.'
+                )
+              ]
+          }}
+      loop: "{{ tls_manual_action_certificates }}"
+      loop_control:
+        label: "{{ item.path }}"
+      tags:
+        - diagnose
+        - remediate
+        - validate
+
+
+    - name: STAGE 21C - Fail when manual renewal is required
+      ansible.builtin.fail:
+        msg: >-
+          {{ tls_manual_action_certificates | length }} certificate(s) require
+          manual renewal and cannot be remediated automatically. See the
+          recommendations in {{ tls_log_file }} for details.
+      when:
+        - tls_fail_on_manual_action | bool
+        - tls_manual_action_certificates | length > 0
+      tags:
+        - diagnose
+        - remediate
+        - validate
 
 
     # ========================================================
@@ -2586,6 +2829,15 @@
           piquickheal_regenerated_count: >-
             {{ tls_regenerated_count | default(0) }}
 
+          piquickheal_manual_action_required: >-
+            {{ tls_manual_action_certificates | length > 0 }}
+
+          piquickheal_manual_action_count: >-
+            {{ tls_manual_action_certificates | length }}
+
+          piquickheal_manual_action_certificates: >-
+            {{ tls_manual_action_certificates }}
+
           piquickheal_remaining_expired_count: >-
             {{ tls_post_expired_count | default(0) }}
 
@@ -2664,6 +2916,11 @@
 
               'Skipped files: ' ~ (tls_skipped_certificates | default([]) | length)
               if (tls_skipped_certificates | default([]) | length) > 0
+              else '',
+
+              'ACTION REQUIRED: ' ~ (tls_manual_action_certificates | length)
+              ~ ' certificate(s) need manual renewal'
+              if (tls_manual_action_certificates | length) > 0
               else '',
 
               'Renewal mechanism: ' ~ tls_primary_renewal_mechanism,
