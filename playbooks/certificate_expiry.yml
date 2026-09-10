@@ -323,7 +323,7 @@
             listening_sockets.stdout_lines
             | default([])
             | map('regex_findall', '(\[?[0-9a-fA-F:\.\*]+\]?):(\d+)\s')
-            | select('length')
+            | select
             | map('first')
             | list
             | unique
@@ -624,7 +624,7 @@
             validation_listening_sockets.stdout_lines
             | default([])
             | map('regex_findall', '(\[?[0-9a-fA-F:\.\*]+\]?):(\d+)\s')
-            | select('length')
+            | select
             | map('first')
             | list
             | unique
