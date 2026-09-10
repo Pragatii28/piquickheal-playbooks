@@ -496,16 +496,62 @@
           }}
       tags: [diagnose]
 
+    - name: "STAGE 1 - Build human-readable diagnosis report"
+      ansible.builtin.set_fact:
+        certificate_diagnosis_report: |-
+          ============================================================
+           PiQuickHeal Certificate Diagnosis - {{ inventory_hostname }}
+           Overall Status: {{ certificate_diagnosis_status }}
+          ============================================================
+          Policy:                        warn <= {{ certificate_warning_days }}d, critical <= {{ certificate_critical_days }}d
+          Certificates found:            {{ discovered_certificates | length }}
+          TLS endpoints probed (live):   {{ discovered_tls_endpoints | length }}
+          Unsupported-format files:      {{ unsupported_format_findings | length }}
+          Renewal method detected:       {{ certificate_renewal_method }}
+          Certbot present:               {{ certbot_binary.rc == 0 }}
+
+          ------------------------------------------------------------
+          CERTIFICATES (file-based)
+          ------------------------------------------------------------
+          {% if discovered_certificates | length == 0 %}
+          (none found)
+          {% else %}
+          {% for cert in discovered_certificates | sort(attribute='days_remaining') %}
+          [{{ '%-13s' | format(cert.status) }}] {{ cert.path }}  (chain {{ cert.chain_index }}/{{ cert.chain_total }}, {{ cert.role }})
+              Subject:  {{ cert.subject }}
+              Issuer:   {{ cert.issuer }}
+              Expires:  {{ cert.not_after }}   ({{ cert.days_remaining }} days remaining)
+          {% endfor %}
+          {% endif %}
+          ------------------------------------------------------------
+          TLS ENDPOINTS (live probes)
+          ------------------------------------------------------------
+          {% if discovered_tls_endpoints | length == 0 %}
+          (none found / none responded)
+          {% else %}
+          {% for ep in discovered_tls_endpoints %}
+          {{ ep.address }}:{{ ep.port }}{% if ep.sni_used %} (sni: {{ ep.sni_used }}){% endif %}
+
+              Subject:  {{ ep.subject | regex_replace('^subject=', '') }}
+              Expires:  {{ ep.not_after | regex_replace('^notAfter=', '') }}
+          {% endfor %}
+          {% endif %}
+          ------------------------------------------------------------
+          UNSUPPORTED FORMAT FILES (manual review required)
+          ------------------------------------------------------------
+          {% if unsupported_format_findings | length == 0 %}
+          (none found)
+          {% else %}
+          {% for f in unsupported_format_findings %}
+          - {{ f.path }}
+          {% endfor %}
+          {% endif %}
+          ============================================================
+      tags: [diagnose]
+
     - name: "DISPLAY DIAGNOSIS OUTPUT"
       ansible.builtin.debug:
-        msg:
-          status: "{{ certificate_diagnosis_status }}"
-          certificate_policy: { warning_days: "{{ certificate_warning_days }}", critical_days: "{{ certificate_critical_days }}" }
-          discovered_certificates: "{{ discovered_certificates }}"
-          discovered_tls_endpoints: "{{ discovered_tls_endpoints }}"
-          unsupported_format_findings: "{{ unsupported_format_findings }}"
-          renewal_method: "{{ certificate_renewal_method }}"
-          certbot_detected: "{{ certbot_binary.rc == 0 }}"
+        msg: "{{ certificate_diagnosis_report.split('\n') }}"
       tags: [diagnose]
 
     - name: "PUBLISH DIAGNOSIS"
@@ -521,6 +567,7 @@
           certificates: "{{ discovered_certificates }}"
           tls_endpoints: "{{ discovered_tls_endpoints }}"
           unsupported_format_findings: "{{ unsupported_format_findings }}"
+          diagnosis_report: "{{ certificate_diagnosis_report }}"
       tags: [diagnose]
 
     # ========================================================
