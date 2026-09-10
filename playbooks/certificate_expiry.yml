@@ -41,6 +41,18 @@
       - /etc/dovecot
       - /etc/postfix
 
+    # System CA trust-store / trust-anchor locations. These typically
+    # hold 50-200+ root & intermediate CA certs that are not
+    # service certificates and don't need "rotation" - including
+    # them just buries the certs that actually matter under noise.
+    # Matched against the full path with a regex OR.
+    certificate_exclude_path_patterns:
+      - '^/etc/ssl/certs/'
+      - '^/etc/pki/ca-trust/'
+      - '^/etc/pki/tls/certs/ca-bundle'
+      - '^/usr/share/ca-certificates/'
+      - '^/etc/pki/nssdb/'
+
     # Formats we can safely parse with `openssl x509`.
     certificate_extensions:
       - "*.crt"
@@ -169,7 +181,14 @@
 
     - name: "STAGE 1 - Build certificate candidate list"
       ansible.builtin.set_fact:
-        certificate_candidates: "{{ certificate_files.files | default([]) | map(attribute='path') | list }}"
+        certificate_candidates: >-
+          {{
+            certificate_files.files | default([])
+            | map(attribute='path')
+            | list
+            | reject('regex_search', certificate_exclude_path_patterns | join('|'))
+            | list
+          }}
       tags: [diagnose]
 
     # --------------------------------------------------------
@@ -511,18 +530,21 @@
           Certbot present:               {{ certbot_binary.rc == 0 }}
 
           ------------------------------------------------------------
-          CERTIFICATES (file-based)
+          CERTIFICATES NEEDING ATTENTION ({{ discovered_certificates | rejectattr('status', 'equalto', 'HEALTHY') | list | length }} of {{ discovered_certificates | length }})
           ------------------------------------------------------------
-          {% if discovered_certificates | length == 0 %}
-          (none found)
+          {% set attention_certs = discovered_certificates | rejectattr('status', 'equalto', 'HEALTHY') | sort(attribute='days_remaining') | list %}
+          {% if attention_certs | length == 0 %}
+          (none - every discovered certificate is HEALTHY)
           {% else %}
-          {% for cert in discovered_certificates | sort(attribute='days_remaining') %}
+          {% for cert in attention_certs %}
           [{{ '%-13s' | format(cert.status) }}] {{ cert.path }}  (chain {{ cert.chain_index }}/{{ cert.chain_total }}, {{ cert.role }})
               Subject:  {{ cert.subject }}
               Issuer:   {{ cert.issuer }}
               Expires:  {{ cert.not_after }}   ({{ cert.days_remaining }} days remaining)
           {% endfor %}
           {% endif %}
+
+          {{ discovered_certificates | selectattr('status', 'equalto', 'HEALTHY') | list | length }} other certificate(s) are HEALTHY (> {{ certificate_warning_days }} days remaining) and are omitted above for brevity.
           ------------------------------------------------------------
           TLS ENDPOINTS (live probes)
           ------------------------------------------------------------
