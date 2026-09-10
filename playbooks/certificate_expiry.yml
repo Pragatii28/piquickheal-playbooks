@@ -147,16 +147,24 @@
       failed_when: false
       tags: [diagnose]
 
+    # --------------------------------------------------------
+    # NOTE (fix): previously used
+    #   map('community.general.dict_kv', 'path')
+    # which requires the community.general collection to be
+    # present in the AWX execution environment. That collection
+    # isn't guaranteed to be in every EE image, and when it's
+    # missing Jinja fails template parsing with an opaque
+    # "the error was: line 0" message rather than a clear one.
+    #
+    # Replaced with a plain Jinja loop that builds the exact
+    # same structure ([{'path': '/etc/...pfx'}, ...]) using only
+    # ansible.builtin filters, so no extra collection is needed.
+    # --------------------------------------------------------
+
     - name: "STAGE 1 - Record unsupported-format findings"
       ansible.builtin.set_fact:
-        unsupported_format_findings: >-
-          {{
-            unsupported_certificate_files.files
-            | default([])
-            | map(attribute='path')
-            | map('community.general.dict_kv', 'path')
-            | list
-          }}
+        unsupported_format_findings: "{{ unsupported_format_findings | default([]) + [{'path': item}] }}"
+      loop: "{{ unsupported_certificate_files.files | default([]) | map(attribute='path') | list }}"
       tags: [diagnose]
 
     - name: "STAGE 1 - Build certificate candidate list"
