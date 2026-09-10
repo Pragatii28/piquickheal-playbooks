@@ -507,7 +507,8 @@
           (none - every discovered certificate is HEALTHY)
           {% else %}
           {% for cert in attention_certs %}
-          [{{ '%-13s' | format(cert.status) }}] {{ cert.path }}  (chain {{ cert.chain_index }}/{{ cert.chain_total }}, {{ cert.role }})
+          [{{ '%-13s' | format(cert.status) }}] chain {{ cert.chain_index }}/{{ cert.chain_total }} ({{ cert.role }})
+              Path:     {{ cert.path }}
               Subject:  {{ cert.subject }}
               Issuer:   {{ cert.issuer }}
               Expires:  {{ cert.not_after }}   ({{ cert.days_remaining }} days remaining)
