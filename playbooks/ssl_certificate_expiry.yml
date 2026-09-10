@@ -38,6 +38,32 @@
 # IMPORTANT:
 #   External/unknown certificate providers are detected but
 #   are NOT executed blindly.
+#
+# CHANGELOG (fixes applied after AWX job 84)
+#   - FIXED: STAGE 5 crashed with
+#       AttributeError: 'NoneType' object has no attribute 'group'
+#     Cause: regex_search() was passed the backreference '\\1' from inside a
+#     YAML folded block scalar. Block scalars do not process escapes, so the
+#     filter received a two-character backslash sequence, took the
+#     "starts with a backslash" branch and then failed its own internal
+#     re.match(). The record parsing is now done in one pass with from_json,
+#     so no backreferences are used at all.
+#   - FIXED: STAGE 5 only ever captured the FIRST certificate per file.
+#     regex_search returns a single match, so a 146-certificate CA bundle
+#     produced exactly one record and 145 certificates were silently dropped.
+#   - FIXED: STAGE 12 always produced an empty port list (same backreference
+#     bug, plus select('string') applied to a list), which meant STAGE 14
+#     never probed any endpoint.
+#   - FIXED: false CRITICAL on OpenSSL trusted-certificate files. `date -d ""`
+#     returns today at midnight, so an unparseable notAfter became
+#     days_remaining=0 -> CRITICAL. Unparseable certificates are now reported
+#     as UNPARSEABLE and excluded from the health verdict.
+#   - CHANGED: certificate inspection moved from a nested shell/openssl loop
+#     (about 8 openssl processes per certificate) to a single Python pass with
+#     one openssl invocation per certificate.
+#   - CHANGED: discovery no longer walks the system CA trust store or vendored
+#     Python certifi/botocore bundles by default. Set
+#     tls_include_trust_stores=true to restore the old behaviour.
 # ============================================================
 
 - name: PiQuickHeal - Dynamic TLS SSL Certificate Health
@@ -57,6 +83,26 @@
     tls_expiry_warning_days: 30
 
     tls_probe_timeout: 5
+
+    # --------------------------------------------------------
+    # Inspection limits
+    #
+    # tls_include_trust_stores:
+    #   false  -> skip the system CA trust store and vendored
+    #             Python certifi/botocore bundles (recommended)
+    #   true   -> inspect everything that was discovered
+    #
+    # tls_max_certs_per_file:
+    #   Hard cap on certificates inspected per file. Files with
+    #   more certificates are reported as TRUNCATED rather than
+    #   inspected in full.
+    # --------------------------------------------------------
+
+    tls_include_trust_stores: false
+
+    tls_max_certs_per_file: 50
+
+    tls_inspector_path: /tmp/piquickheal_tls_inspect.py
 
     # --------------------------------------------------------
     # Certificate discovery paths
@@ -95,6 +141,32 @@
       - /var/lib/containers
       - /var/cache
       - /usr/share/doc
+
+    # --------------------------------------------------------
+    # Path fragments which are certificate trust stores rather
+    # than serving certificates.
+    #
+    # These are large multi-certificate bundles. They are not
+    # what a TLS listener presents to a client, and inspecting
+    # them buries the real leaf certificates in noise.
+    #
+    # Applied only when tls_include_trust_stores is false.
+    # --------------------------------------------------------
+
+    tls_trust_store_patterns:
+
+      - "/ca-trust/"
+      - "/ca-certificates"
+      - "ca-bundle"
+      - "ca-certificates.crt"
+      - "cacert.pem"
+      - "/certifi/"
+      - "/botocore/"
+      - "/site-packages/"
+      - "/dist-packages/"
+      - "tls-ca-bundle.pem"
+      - "email-ca-bundle.pem"
+      - "objsign-ca-bundle.pem"
 
     # --------------------------------------------------------
     # Certificate extensions
@@ -166,6 +238,10 @@
         tls_findings: []
         tls_recommendations: []
 
+        tls_skipped_certificates: []
+        tls_unparseable_certificates: []
+        tls_candidate_ports: []
+
       tags:
         - always
         - diagnose
@@ -177,9 +253,18 @@
     # STAGE 2 - REQUIRED BINARIES
     # ========================================================
 
+    # --------------------------------------------------------
+    # `command -v` is a shell builtin, so it has to run under a
+    # shell. ansible.builtin.command executes without a shell
+    # and its behaviour here depends on whether the platform
+    # happens to ship a /usr/bin/command, which is not portable.
+    # --------------------------------------------------------
+
     - name: STAGE 2 - Check required binaries
-      ansible.builtin.command:
-        cmd: "command -v {{ item }}"
+      ansible.builtin.shell: |
+        command -v "{{ item }}" >/dev/null 2>&1
+      args:
+        executable: /bin/bash
       register: tls_binary_check
       changed_when: false
       failed_when: false
@@ -257,9 +342,9 @@
         - validate
 
 
-    - name: STAGE 3 - Build certificate candidate list
+    - name: STAGE 3 - Build raw certificate candidate list
       ansible.builtin.set_fact:
-        tls_certificate_candidates: >-
+        tls_certificate_candidates_raw: >-
           {{
             tls_discovered_files.stdout_lines
             | default([])
@@ -268,6 +353,8 @@
             | reject('search', '^/sys/')
             | reject('search', '^/dev/')
             | reject('search', '^/run/')
+            | reject('search', '/var/lib/docker/')
+            | reject('search', '/var/lib/containers/')
             | list
           }}
       tags:
@@ -276,366 +363,363 @@
         - validate
 
 
+    # --------------------------------------------------------
+    # Drop trust stores unless explicitly requested.
+    #
+    # Job 84 inspected 146-, 127- and 298-certificate bundles
+    # from /etc/pki/ca-trust and from Datadog's vendored certifi
+    # copies. None of those are serving certificates.
+    # --------------------------------------------------------
+
+    - name: STAGE 3 - Build certificate candidate list
+      ansible.builtin.set_fact:
+        tls_certificate_candidates: >-
+          {{
+            tls_certificate_candidates_raw
+            if (tls_include_trust_stores | bool)
+            else (
+              tls_certificate_candidates_raw
+              | reject('search', tls_trust_store_patterns | join('|'))
+              | list
+            )
+          }}
+      tags:
+        - diagnose
+        - remediate
+        - validate
+
+
+    - name: STAGE 3 - Report discovery scope
+      ansible.builtin.debug:
+        msg: >-
+          Discovered {{ tls_certificate_candidates_raw | length }} candidate
+          files, inspecting {{ tls_certificate_candidates | length }}
+          (trust stores
+          {{ 'included' if tls_include_trust_stores | bool else 'excluded' }}).
+      tags:
+        - diagnose
+        - remediate
+        - validate
+
+
     # ========================================================
     # STAGE 4 - CERTIFICATE INSPECTION
+    #
+    # The previous implementation ran a shell loop that spawned
+    # roughly eight openssl processes per certificate, then
+    # printed KEY=VALUE records that had to be re-parsed with
+    # regular expressions on the controller.
+    #
+    # It now deploys one Python helper that emits JSON directly.
+    # One openssl invocation per certificate, one parse, no
+    # regular expressions on the controller side.
     # ========================================================
 
+    - name: STAGE 4 - Deploy certificate inspector
+      ansible.builtin.copy:
+        dest: "{{ tls_inspector_path }}"
+        mode: "0700"
+        owner: root
+        group: root
+        content: |
+          #!/usr/bin/env python3
+          """
+          PiQuickHeal TLS certificate inspector.
+
+          Reads a newline-delimited list of candidate certificate file paths on stdin,
+          inspects every certificate found in each file, and writes a single JSON
+          document to stdout.
+
+          One `openssl x509` invocation per certificate (not per attribute), so a
+          150-certificate CA bundle costs 150 subprocesses instead of ~1200.
+          """
+
+          import calendar
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import time
+
+          PEM_BLOCK = re.compile(
+              rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+              re.DOTALL,
+          )
+
+          OPENSSL_ARGS = [
+              "-noout",
+              "-nameopt", "rfc2253",
+              "-subject",
+              "-issuer",
+              "-serial",
+              "-fingerprint", "-sha256",
+              "-startdate",
+              "-enddate",
+              "-ext", "basicConstraints,subjectAltName",
+          ]
+
+          MONTHS = {
+              "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+              "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+          }
+
+          PROVIDER_PATTERNS = [
+              ("LETS_ENCRYPT", ("let's encrypt", "lets encrypt")),
+              ("DIGICERT", ("digicert",)),
+              ("GODADDY", ("godaddy",)),
+              ("SECTIGO_COMODO", ("sectigo", "comodo")),
+              ("GLOBALSIGN", ("globalsign",)),
+              ("ENTRUST", ("entrust",)),
+              ("AMAZON_ACM", ("amazon", "aws")),
+              ("GOOGLE_TRUST", ("google trust",)),
+              ("ZEROSSL", ("zerossl",)),
+          ]
+
+
+          def run_openssl(payload, inform):
+              """Return openssl -text-ish attribute output for one certificate."""
+              cmd = ["openssl", "x509", "-inform", inform] + OPENSSL_ARGS
+              try:
+                  proc = subprocess.run(
+                      cmd,
+                      input=payload,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.DEVNULL,
+                      timeout=15,
+                  )
+              except (OSError, subprocess.TimeoutExpired):
+                  return None
+              if proc.returncode != 0:
+                  return None
+              return proc.stdout.decode("utf-8", "replace")
+
+
+          def parse_openssl_date(value):
+              """Parse 'Feb  1 00:00:00 2020 GMT' without shelling out to date(1)."""
+              if not value:
+                  return None
+              parts = value.replace("GMT", "").split()
+              if len(parts) < 4:
+                  return None
+              try:
+                  month = MONTHS[parts[0][:3]]
+                  day = int(parts[1])
+                  clock = parts[2].split(":")
+                  year = int(parts[3])
+                  hour, minute, second = (int(clock[0]), int(clock[1]), int(clock[2]))
+              except (KeyError, ValueError, IndexError):
+                  return None
+              # X.509 notBefore/notAfter are UTC. timegm() converts a UTC struct
+              # directly, so the result does not depend on the host time zone.
+              try:
+                  return int(
+                      calendar.timegm((year, month, day, hour, minute, second, 0, 1, -1))
+                  )
+              except (OverflowError, ValueError):
+                  return None
+
+
+          def parse_attributes(text):
+              """Turn openssl attribute output into a flat dict."""
+              out = {
+                  "subject": "",
+                  "issuer": "",
+                  "serial": "",
+                  "fingerprint": "",
+                  "not_before": "",
+                  "not_after": "",
+                  "san": "",
+                  "is_ca": False,
+              }
+              lines = text.splitlines()
+              for index, line in enumerate(lines):
+                  stripped = line.strip()
+                  if line.startswith("subject="):
+                      out["subject"] = line.split("=", 1)[1].strip()
+                  elif line.startswith("issuer="):
+                      out["issuer"] = line.split("=", 1)[1].strip()
+                  elif line.startswith("serial="):
+                      out["serial"] = line.split("=", 1)[1].strip()
+                  elif "Fingerprint=" in line:
+                      out["fingerprint"] = line.split("=", 1)[1].strip()
+                  elif line.startswith("notBefore="):
+                      out["not_before"] = line.split("=", 1)[1].strip()
+                  elif line.startswith("notAfter="):
+                      out["not_after"] = line.split("=", 1)[1].strip()
+                  elif "Basic Constraints" in line:
+                      window = " ".join(lines[index:index + 3]).upper()
+                      if "CA:TRUE" in window:
+                          out["is_ca"] = True
+                  elif stripped.startswith(("DNS:", "IP Address:", "email:", "URI:")):
+                      existing = out["san"]
+                      out["san"] = (existing + " " + stripped).strip() if existing else stripped
+              return out
+
+
+          def detect_provider(issuer, self_signed):
+              lowered = issuer.lower()
+              for name, needles in PROVIDER_PATTERNS:
+                  for needle in needles:
+                      if needle in lowered:
+                          return name
+              if self_signed:
+                  return "SELF_SIGNED"
+              return "UNKNOWN"
+
+
+          def classify(days_remaining, critical_days, warning_days):
+              if days_remaining is None:
+                  return "UNPARSEABLE"
+              if days_remaining < 0:
+                  return "EXPIRED"
+              if days_remaining <= critical_days:
+                  return "CRITICAL"
+              if days_remaining <= warning_days:
+                  return "EXPIRING_SOON"
+              return "HEALTHY"
+
+
+          def read_blocks(path, max_certs):
+              """Return (blocks, total_found) for one file, honouring max_certs."""
+              try:
+                  with open(path, "rb") as handle:
+                      raw = handle.read()
+              except OSError:
+                  return [], 0
+
+              blocks = PEM_BLOCK.findall(raw)
+              if blocks:
+                  payloads = [(block + b"\n", "PEM") for block in blocks[:max_certs]]
+                  return payloads, len(blocks)
+              if raw[:1] == b"\x30":
+                  return [(raw, "DER")], 1
+              return [], 0
+
+
+          def main():
+              critical_days = int(os.environ.get("TLS_CRITICAL_DAYS", "7"))
+              warning_days = int(os.environ.get("TLS_WARNING_DAYS", "30"))
+              max_certs = int(os.environ.get("TLS_MAX_CERTS_PER_FILE", "50"))
+
+              now = int(time.time())
+              records = []
+              skipped = []
+
+              paths = [line.strip() for line in sys.stdin if line.strip()]
+
+              for path in paths:
+                  if not os.path.isfile(path) or not os.access(path, os.R_OK):
+                      skipped.append({"path": path, "reason": "UNREADABLE"})
+                      continue
+
+                  blocks, total = read_blocks(path, max_certs)
+                  if not blocks:
+                      skipped.append({"path": path, "reason": "NOT_A_CERTIFICATE"})
+                      continue
+
+                  if total > len(blocks):
+                      skipped.append(
+                          {
+                              "path": path,
+                              "reason": "TRUNCATED",
+                              "found": total,
+                              "inspected": len(blocks),
+                          }
+                      )
+                  for index, (payload, inform) in enumerate(blocks, start=1):
+                      text = run_openssl(payload, inform)
+                      if text is None:
+                          skipped.append(
+                              {
+                                  "path": path,
+                                  "reason": "UNPARSEABLE",
+                                  "chain_index": index,
+                              }
+                          )
+                          continue
+
+                      attrs = parse_attributes(text)
+                      end_epoch = parse_openssl_date(attrs["not_after"])
+
+                      if end_epoch is None:
+                          days_remaining = None
+                      else:
+                          days_remaining = (end_epoch - now) // 86400
+
+                      self_signed = bool(
+                          attrs["subject"] and attrs["subject"] == attrs["issuer"]
+                      )
+
+                      records.append(
+                          {
+                              "path": path,
+                              "format": inform,
+                              "chain_index": index,
+                              "chain_total": total,
+                              "subject": attrs["subject"],
+                              "issuer": attrs["issuer"],
+                              "serial": attrs["serial"],
+                              "fingerprint": attrs["fingerprint"],
+                              "not_before": attrs["not_before"],
+                              "not_after": attrs["not_after"],
+                              "days_remaining": days_remaining,
+                              "status": classify(days_remaining, critical_days, warning_days),
+                              "is_ca": attrs["is_ca"],
+                              "self_signed": self_signed,
+                              "provider": detect_provider(attrs["issuer"], self_signed),
+                              "san": attrs["san"],
+                              "is_bundle": total > 1,
+                          }
+                      )
+
+              json.dump(
+                  {
+                      "generated_at": now,
+                      "candidate_count": len(paths),
+                      "record_count": len(records),
+                      "records": records,
+                      "skipped": skipped,
+                  },
+                  sys.stdout,
+              )
+              sys.stdout.write("\n")
+
+
+          if __name__ == "__main__":
+              main()
+      tags:
+        - diagnose
+        - remediate
+        - validate
+
+
     - name: STAGE 4 - Inspect certificates
-      ansible.builtin.shell: |
-        set -o pipefail
-
-        FILE="{{ item }}"
-
-        if [ ! -r "$FILE" ]; then
-          exit 2
-        fi
-
-        # ----------------------------------------------------
-        # Determine certificate format
-        # ----------------------------------------------------
-
-        if openssl x509 -in "$FILE" -noout >/dev/null 2>&1; then
-          INFORM="PEM"
-
-        elif openssl x509 \
-            -inform DER \
-            -in "$FILE" \
-            -noout >/dev/null 2>&1; then
-
-          INFORM="DER"
-
-        else
-          exit 2
-        fi
-
-
-        # ----------------------------------------------------
-        # Count certificates in PEM bundle
-        # ----------------------------------------------------
-
-        if [ "$INFORM" = "PEM" ]; then
-
-          COUNT=$(
-            grep -c "BEGIN CERTIFICATE" "$FILE" 2>/dev/null || true
-          )
-
-          if [ -z "$COUNT" ] || [ "$COUNT" -lt 1 ]; then
-            COUNT=1
-          fi
-
-        else
-          COUNT=1
-        fi
-
-
-        # ----------------------------------------------------
-        # Parse certificates
-        # ----------------------------------------------------
-
-        i=1
-
-        while [ "$i" -le "$COUNT" ]; do
-
-          if [ "$INFORM" = "DER" ]; then
-
-            SUBJECT=$(
-              openssl x509 \
-                -inform DER \
-                -in "$FILE" \
-                -noout \
-                -subject 2>/dev/null |
-              sed 's/^subject=//'
-            )
-
-            ISSUER=$(
-              openssl x509 \
-                -inform DER \
-                -in "$FILE" \
-                -noout \
-                -issuer 2>/dev/null |
-              sed 's/^issuer=//'
-            )
-
-            SERIAL=$(
-              openssl x509 \
-                -inform DER \
-                -in "$FILE" \
-                -noout \
-                -serial 2>/dev/null |
-              cut -d= -f2
-            )
-
-            FINGERPRINT=$(
-              openssl x509 \
-                -inform DER \
-                -in "$FILE" \
-                -noout \
-                -fingerprint \
-                -sha256 2>/dev/null |
-              cut -d= -f2
-            )
-
-            NOT_BEFORE=$(
-              openssl x509 \
-                -inform DER \
-                -in "$FILE" \
-                -noout \
-                -startdate 2>/dev/null |
-              cut -d= -f2-
-            )
-
-            NOT_AFTER=$(
-              openssl x509 \
-                -inform DER \
-                -in "$FILE" \
-                -noout \
-                -enddate 2>/dev/null |
-              cut -d= -f2-
-            )
-
-            BASIC_CONSTRAINTS=$(
-              openssl x509 \
-                -inform DER \
-                -in "$FILE" \
-                -noout \
-                -text 2>/dev/null |
-              grep -A2 "Basic Constraints" |
-              head -2
-            )
-
-            SAN=$(
-              openssl x509 \
-                -inform DER \
-                -in "$FILE" \
-                -noout \
-                -ext subjectAltName 2>/dev/null |
-              tail -n +2 |
-              tr '\n' ' '
-            )
-
-          else
-
-            CERT_PEM=$(
-              awk -v n="$i" '
-                /BEGIN CERTIFICATE/ { count++ }
-                count == n { print }
-                count == n && /END CERTIFICATE/ { exit }
-              ' "$FILE"
-            )
-
-
-            SUBJECT=$(
-              printf '%s\n' "$CERT_PEM" |
-              openssl x509 \
-                -noout \
-                -subject 2>/dev/null |
-              sed 's/^subject=//'
-            )
-
-            ISSUER=$(
-              printf '%s\n' "$CERT_PEM" |
-              openssl x509 \
-                -noout \
-                -issuer 2>/dev/null |
-              sed 's/^issuer=//'
-            )
-
-            SERIAL=$(
-              printf '%s\n' "$CERT_PEM" |
-              openssl x509 \
-                -noout \
-                -serial 2>/dev/null |
-              cut -d= -f2
-            )
-
-            FINGERPRINT=$(
-              printf '%s\n' "$CERT_PEM" |
-              openssl x509 \
-                -noout \
-                -fingerprint \
-                -sha256 2>/dev/null |
-              cut -d= -f2
-            )
-
-            NOT_BEFORE=$(
-              printf '%s\n' "$CERT_PEM" |
-              openssl x509 \
-                -noout \
-                -startdate 2>/dev/null |
-              cut -d= -f2-
-            )
-
-            NOT_AFTER=$(
-              printf '%s\n' "$CERT_PEM" |
-              openssl x509 \
-                -noout \
-                -enddate 2>/dev/null |
-              cut -d= -f2-
-            )
-
-            BASIC_CONSTRAINTS=$(
-              printf '%s\n' "$CERT_PEM" |
-              openssl x509 \
-                -noout \
-                -text 2>/dev/null |
-              grep -A2 "Basic Constraints" |
-              head -2
-            )
-
-            SAN=$(
-              printf '%s\n' "$CERT_PEM" |
-              openssl x509 \
-                -noout \
-                -ext subjectAltName 2>/dev/null |
-              tail -n +2 |
-              tr '\n' ' '
-            )
-
-          fi
-
-
-          # --------------------------------------------------
-          # Convert expiry date to epoch
-          # --------------------------------------------------
-
-          END_EPOCH=$(
-            date -d "$NOT_AFTER" +%s 2>/dev/null || echo 0
-          )
-
-          NOW_EPOCH=$(date +%s)
-
-
-          # --------------------------------------------------
-          # IMPORTANT:
-          # Correct Bash arithmetic syntax.
-          # --------------------------------------------------
-
-          if [ "$END_EPOCH" -gt 0 ]; then
-            DAYS_REMAINING=$(( (END_EPOCH - NOW_EPOCH) / 86400 ))
-          else
-            DAYS_REMAINING=-99999
-          fi
-
-
-          # --------------------------------------------------
-          # Certificate status
-          # --------------------------------------------------
-
-          if [ "$DAYS_REMAINING" -lt 0 ]; then
-            STATUS="EXPIRED"
-
-          elif [ "$DAYS_REMAINING" -le {{ tls_expiry_critical_days }} ]; then
-            STATUS="CRITICAL"
-
-          elif [ "$DAYS_REMAINING" -le {{ tls_expiry_warning_days }} ]; then
-            STATUS="EXPIRING_SOON"
-
-          else
-            STATUS="HEALTHY"
-          fi
-
-
-          # --------------------------------------------------
-          # Certificate type
-          # --------------------------------------------------
-
-          IS_CA="false"
-
-          if printf '%s\n' "$BASIC_CONSTRAINTS" |
-             grep -qi "CA:TRUE"; then
-            IS_CA="true"
-          fi
-
-
-          # --------------------------------------------------
-          # Self-signed detection
-          # --------------------------------------------------
-
-          SELF_SIGNED="false"
-
-          if [ "$SUBJECT" = "$ISSUER" ]; then
-            SELF_SIGNED="true"
-          fi
-
-
-          # --------------------------------------------------
-          # Provider / issuer detection
-          # --------------------------------------------------
-
-          ISSUER_LOWER=$(printf '%s' "$ISSUER" | tr '[:upper:]' '[:lower:]')
-
-          if printf '%s' "$ISSUER_LOWER" | grep -q "let's encrypt"; then
-            PROVIDER="LETS_ENCRYPT"
-
-          elif printf '%s' "$ISSUER_LOWER" | grep -q "digicert"; then
-            PROVIDER="DIGICERT"
-
-          elif printf '%s' "$ISSUER_LOWER" | grep -q "godaddy"; then
-            PROVIDER="GODADDY"
-
-          elif printf '%s' "$ISSUER_LOWER" |
-               grep -Eq "sectigo|comodo"; then
-            PROVIDER="SECTIGO_COMODO"
-
-          elif printf '%s' "$ISSUER_LOWER" |
-               grep -q "globalsign"; then
-            PROVIDER="GLOBALSIGN"
-
-          elif printf '%s' "$ISSUER_LOWER" |
-               grep -q "entrust"; then
-            PROVIDER="ENTRUST"
-
-          elif printf '%s' "$ISSUER_LOWER" |
-               grep -Eq "amazon|aws"; then
-            PROVIDER="AMAZON_ACM"
-
-          elif [ "$SELF_SIGNED" = "true" ]; then
-            PROVIDER="SELF_SIGNED"
-
-          else
-            PROVIDER="UNKNOWN"
-          fi
-
-
-          # --------------------------------------------------
-          # Print machine-readable record
-          # --------------------------------------------------
-
-          printf '%s\n' \
-            "PATH=$FILE" \
-            "FORMAT=$INFORM" \
-            "CHAIN_INDEX=$i" \
-            "CHAIN_TOTAL=$COUNT" \
-            "SUBJECT=$SUBJECT" \
-            "ISSUER=$ISSUER" \
-            "SERIAL=$SERIAL" \
-            "FINGERPRINT=$FINGERPRINT" \
-            "NOT_BEFORE=$NOT_BEFORE" \
-            "NOT_AFTER=$NOT_AFTER" \
-            "DAYS_REMAINING=$DAYS_REMAINING" \
-            "STATUS=$STATUS" \
-            "IS_CA=$IS_CA" \
-            "SELF_SIGNED=$SELF_SIGNED" \
-            "PROVIDER=$PROVIDER" \
-            "SAN=$SAN" \
-            "---RECORD-END---"
-
-          i=$((i + 1))
-
-        done
-
-      args:
-        executable: /bin/bash
-
+      ansible.builtin.command:
+        # Executed via its own shebang rather than
+        # "{{ ansible_python_interpreter }} <script>", because that
+        # variable is frequently the literal string "auto" or
+        # "auto_silent" in inventory and would not be a usable path.
+        cmd: "{{ tls_inspector_path }}"
+        stdin: "{{ tls_certificate_candidates | join('\n') }}"
+      environment:
+        TLS_CRITICAL_DAYS: "{{ tls_expiry_critical_days }}"
+        TLS_WARNING_DAYS: "{{ tls_expiry_warning_days }}"
+        TLS_MAX_CERTS_PER_FILE: "{{ tls_max_certs_per_file }}"
       register: tls_certificate_inspection
       changed_when: false
       failed_when: false
+      tags:
+        - diagnose
+        - remediate
+        - validate
 
-      loop: "{{ tls_certificate_candidates }}"
 
-      loop_control:
-        label: "{{ item }}"
-
+    - name: STAGE 4 - Remove certificate inspector
+      ansible.builtin.file:
+        path: "{{ tls_inspector_path }}"
+        state: absent
+      failed_when: false
       tags:
         - diagnose
         - remediate
@@ -644,11 +728,47 @@
 
     # ========================================================
     # STAGE 5 - BUILD CERTIFICATE RECORDS
+    #
+    # This replaces the looped set_fact that failed in job 84.
+    #
+    # Two separate defects were fixed here:
+    #
+    #   1. regex_search(..., '\\1') inside a YAML folded block
+    #      scalar reaches the filter as a two-character
+    #      backslash sequence. The filter takes its
+    #      "starts with a backslash" branch and then its own
+    #      internal re.match() returns None, which is the
+    #      AttributeError seen on every one of the 180 items.
+    #
+    #   2. regex_search returns only the FIRST match, so one
+    #      record was built per FILE rather than per
+    #      CERTIFICATE. Every bundle lost all but its first
+    #      certificate.
+    #
+    # A single from_json parse avoids both, and avoids
+    # re-templating a growing list once per loop iteration.
     # ========================================================
 
-    - name: STAGE 5 - Initialize flattened certificate records
+    - name: STAGE 5 - Parse inspector output
       ansible.builtin.set_fact:
-        tls_certificate_records: []
+        tls_inspection_result: >-
+          {{
+            tls_certificate_inspection.stdout
+            | default('')
+            | trim
+            | from_json
+            if (
+              (tls_certificate_inspection.rc | default(1)) == 0
+              and (tls_certificate_inspection.stdout | default('') | trim | length) > 0
+            )
+            else {
+              'generated_at': 0,
+              'candidate_count': 0,
+              'record_count': 0,
+              'records': [],
+              'skipped': []
+            }
+          }}
       tags:
         - diagnose
         - remediate
@@ -657,112 +777,28 @@
 
     - name: STAGE 5 - Build certificate records
       ansible.builtin.set_fact:
-        tls_certificate_records: >-
-          {{
-            tls_certificate_records +
-            [
-              {
-                'path': item.item,
-                'format': (
-                  item.stdout
-                  | regex_search('(?m)^FORMAT=(.*)$', '\\1')
-                  | default(['UNKNOWN'], true)
-                  | first
-                ),
-                'chain_index': (
-                  item.stdout
-                  | regex_search('(?m)^CHAIN_INDEX=(.*)$', '\\1')
-                  | default(['0'], true)
-                  | first
-                  | int
-                ),
-                'chain_total': (
-                  item.stdout
-                  | regex_search('(?m)^CHAIN_TOTAL=(.*)$', '\\1')
-                  | default(['0'], true)
-                  | first
-                  | int
-                ),
-                'subject': (
-                  item.stdout
-                  | regex_search('(?m)^SUBJECT=(.*)$', '\\1')
-                  | default([''], true)
-                  | first
-                ),
-                'issuer': (
-                  item.stdout
-                  | regex_search('(?m)^ISSUER=(.*)$', '\\1')
-                  | default([''], true)
-                  | first
-                ),
-                'serial': (
-                  item.stdout
-                  | regex_search('(?m)^SERIAL=(.*)$', '\\1')
-                  | default([''], true)
-                  | first
-                ),
-                'fingerprint': (
-                  item.stdout
-                  | regex_search('(?m)^FINGERPRINT=(.*)$', '\\1')
-                  | default([''], true)
-                  | first
-                ),
-                'not_before': (
-                  item.stdout
-                  | regex_search('(?m)^NOT_BEFORE=(.*)$', '\\1')
-                  | default([''], true)
-                  | first
-                ),
-                'not_after': (
-                  item.stdout
-                  | regex_search('(?m)^NOT_AFTER=(.*)$', '\\1')
-                  | default([''], true)
-                  | first
-                ),
-                'days_remaining': (
-                  item.stdout
-                  | regex_search('(?m)^DAYS_REMAINING=(-?[0-9]+)$', '\\1')
-                  | default(['-99999'], true)
-                  | first
-                  | int
-                ),
-                'status': (
-                  item.stdout
-                  | regex_search('(?m)^STATUS=(.*)$', '\\1')
-                  | default(['UNKNOWN'], true)
-                  | first
-                ),
-                'is_ca': (
-                  item.stdout
-                  | regex_search('(?m)^IS_CA=(.*)$', '\\1')
-                  | default(['false'], true)
-                  | first
-                ),
-                'self_signed': (
-                  item.stdout
-                  | regex_search('(?m)^SELF_SIGNED=(.*)$', '\\1')
-                  | default(['false'], true)
-                  | first
-                ),
-                'provider': (
-                  item.stdout
-                  | regex_search('(?m)^PROVIDER=(.*)$', '\\1')
-                  | default(['UNKNOWN'], true)
-                  | first
-                ),
-                'san': (
-                  item.stdout
-                  | regex_search('(?m)^SAN=(.*)$', '\\1')
-                  | default([''], true)
-                  | first
-                )
-              }
-            ]
-          }}
-      loop: "{{ tls_certificate_inspection.results }}"
-      when:
-        - item.rc | default(1) == 0
-        - "'---RECORD-END---' in item.stdout"
+        tls_certificate_records: "{{ tls_inspection_result.records | default([]) }}"
+        tls_skipped_certificates: "{{ tls_inspection_result.skipped | default([]) }}"
+      tags:
+        - diagnose
+        - remediate
+        - validate
+
+
+    - name: STAGE 5 - Assert inspection produced records
+      ansible.builtin.assert:
+        that:
+          - tls_certificate_records | length > 0
+        fail_msg: >-
+          Certificate inspection returned no records.
+          Candidates: {{ tls_certificate_candidates | length }}.
+          Inspector rc: {{ tls_certificate_inspection.rc | default('unset') }}.
+          Inspector stderr: {{ tls_certificate_inspection.stderr | default('') }}
+        success_msg: >-
+          Parsed {{ tls_certificate_records | length }} certificate records
+          from {{ tls_certificate_candidates | length }} files
+          ({{ tls_skipped_certificates | length }} skipped).
+      when: tls_certificate_candidates | length > 0
       tags:
         - diagnose
         - remediate
@@ -778,7 +814,7 @@
         tls_leaf_certificates: >-
           {{
             tls_certificate_records
-            | selectattr('is_ca', 'equalto', 'false')
+            | rejectattr('is_ca')
             | list
           }}
       tags:
@@ -792,7 +828,7 @@
         tls_ca_certificates: >-
           {{
             tls_certificate_records
-            | selectattr('is_ca', 'equalto', 'true')
+            | selectattr('is_ca')
             | list
           }}
       tags:
@@ -1001,9 +1037,28 @@
     # STAGE 12 - DISCOVER TLS LISTENERS
     # ========================================================
 
-    - name: STAGE 12 - Discover listening TCP sockets
+    # --------------------------------------------------------
+    # The port is extracted in the shell, not with a Jinja
+    # regex.
+    #
+    # `ss -lntH` prints
+    #   State Recv-Q Send-Q Local:Port Peer:Port [Process]
+    #
+    # so the port is inside field 4, never at the end of the
+    # line. The previous end-of-line regex could never match,
+    # which is the second reason tls_candidate_ports was always
+    # empty and STAGE 14 never probed anything.
+    # --------------------------------------------------------
+
+    - name: STAGE 12 - Discover listening TCP ports
       ansible.builtin.shell: |
-        ss -lntH 2>/dev/null
+        set -o pipefail
+
+        ss -lntH 2>/dev/null |
+        awk '{print $4}' |
+        sed 's/.*://' |
+        grep -E '^[0-9]+$' |
+        sort -un || true
       args:
         executable: /bin/bash
       register: tls_listeners
@@ -1021,9 +1076,8 @@
           {{
             tls_listeners.stdout_lines
             | default([])
-            | map('regex_search', ':(\\d+)\\s*$', '\\1')
-            | select('string')
-            | map('first')
+            | map('trim')
+            | reject('equalto', '')
             | map('int')
             | select('in',
               [
@@ -1223,6 +1277,29 @@
         - validate
 
 
+    # --------------------------------------------------------
+    # Certificates whose notAfter could not be read.
+    #
+    # In job 84 these were silently reported as CRITICAL,
+    # because `date -d ""` resolves to today at midnight and
+    # integer division then produced days_remaining=0. They are
+    # now reported separately and excluded from the verdict.
+    # --------------------------------------------------------
+
+    - name: STAGE 15 - Find unparseable certificates
+      ansible.builtin.set_fact:
+        tls_unparseable_certificates: >-
+          {{
+            tls_certificate_records
+            | selectattr('status', 'equalto', 'UNPARSEABLE')
+            | list
+          }}
+      tags:
+        - diagnose
+        - remediate
+        - validate
+
+
     # ========================================================
     # STAGE 16 - GENERATE FINDINGS
     # ========================================================
@@ -1257,6 +1334,18 @@
             Certificates expiring within
             {{ tls_expiry_warning_days }} days:
             {{ tls_expiring_certificates | length }}
+
+          - >-
+            Unparseable certificates:
+            {{ tls_unparseable_certificates | length }}
+
+          - >-
+            Files skipped during inspection:
+            {{ tls_skipped_certificates | default([]) | length }}
+
+          - >-
+            Detected TLS ports:
+            {{ tls_candidate_ports | default([]) | join(', ') | default('none', true) }}
 
           - >-
             Detected renewal mechanism:
@@ -1646,6 +1735,9 @@
           Certificate Records:
           {{ tls_certificate_records | to_nice_json }}
 
+          Skipped:
+          {{ tls_skipped_certificates | default([]) | to_nice_json }}
+
           Findings:
           {{ tls_findings | to_nice_json }}
 
@@ -1699,6 +1791,15 @@
           piquickheal_expiring_soon_count: >-
             {{ tls_expiring_certificates | length }}
 
+          piquickheal_unparseable_count: >-
+            {{ tls_unparseable_certificates | length }}
+
+          piquickheal_skipped_count: >-
+            {{ tls_skipped_certificates | default([]) | length }}
+
+          piquickheal_candidate_file_count: >-
+            {{ tls_certificate_candidates | length }}
+
           piquickheal_findings: >-
             {{ tls_findings }}
 
@@ -1735,6 +1836,8 @@
           - "Expired: {{ tls_expired_certificates | length }}"
           - "Critical: {{ tls_critical_certificates | length }}"
           - "Expiring soon: {{ tls_expiring_certificates | length }}"
+          - "Unparseable: {{ tls_unparseable_certificates | length }}"
+          - "Skipped files: {{ tls_skipped_certificates | default([]) | length }}"
           - "============================================================"
       tags:
         - diagnose
