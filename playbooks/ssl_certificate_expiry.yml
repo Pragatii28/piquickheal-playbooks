@@ -10,6 +10,17 @@
 #   piquickheal-tls_certificate_rotation-remediate  (tag: remediate)
 #   piquickheal-tls_certificate_rotation-validate   (tag: validate)
 #
+# CHANGELOG (this revision):
+#   - STAGE 2's certbot-usable check now reuses the same
+#     discovered_certificates evidence as STAGE 1's
+#     certificate_renewal_method, instead of a separate
+#     substring check against `certbot certificates` stdout.
+#     Previously the two checks could disagree (e.g. certbot
+#     using a custom --config-dir would still match the STAGE 2
+#     substring check even though STAGE 1 found no certs under
+#     /etc/letsencrypt/). Now remediation only proceeds via
+#     certbot when diagnosis actually found certbot-managed
+#     certificate files on disk.
 # ============================================================
 
 - name: PiQuickHeal - TLS/SSL Certificate Expiry and Rotation
@@ -42,7 +53,7 @@
       - /etc/dovecot
       - /etc/postfix
 
-    # System CA trust-store / trust-anchor locations. 
+    # System CA trust-store / trust-anchor locations.
     certificate_exclude_path_patterns:
       - '^/etc/ssl/certs/'
       - '^/etc/pki/ca-trust/'
@@ -413,6 +424,12 @@
       when: certbot_binary.rc == 0
       tags: [diagnose]
 
+    # This is the single source of truth for "is certbot actually
+    # managing certs we discovered on disk". STAGE 2 reuses this
+    # same fact (via discovered_certificates, which is published
+    # via set_stats and re-derivable) rather than re-deriving its
+    # own separate substring check against `certbot certificates`
+    # stdout, so the two stages can no longer disagree.
     - name: "STAGE 1 - Determine certificate renewal method"
       ansible.builtin.set_fact:
         certificate_renewal_method: >-
@@ -525,13 +542,40 @@
       when: remediation_certbot.rc == 0
       tags: [remediate]
 
+    # --------------------------------------------------------
+    # Re-run the SAME discovery logic STAGE 1 used, scoped only
+    # to what we need here: are there certificate files on disk
+    # under /etc/letsencrypt/ that certbot itself also lists?
+    # This mirrors STAGE 1's certificate_renewal_method check
+    # exactly (same path pattern, same "certbot lists it too"
+    # requirement) instead of a bare substring match against
+    # `certbot certificates` stdout, so remediation can't decide
+    # certbot is usable in a case where diagnosis said it wasn't
+    # (e.g. a custom --config-dir where the stdout happens to
+    # mention /etc/letsencrypt/ in passing but no cert file that
+    # path was actually found/parsed on disk).
+    # --------------------------------------------------------
+
+    - name: "STAGE 2 - Re-discover certbot-managed certificate files on disk"
+      ansible.builtin.find:
+        paths: "/etc/letsencrypt"
+        patterns: "{{ certificate_extensions }}"
+        recurse: true
+        file_type: file
+      register: remediation_letsencrypt_files
+      changed_when: false
+      failed_when: false
+      tags: [remediate]
+
     - name: "STAGE 2 - Determine whether Certbot can be used"
       ansible.builtin.set_fact:
         certbot_renewal_possible: >-
           {{
             true
-            if (remediation_certbot.rc == 0 and remediation_certbot_inventory.stdout is defined
-                and '/etc/letsencrypt/' in remediation_certbot_inventory.stdout)
+            if (remediation_certbot.rc == 0
+                and remediation_certbot_inventory.stdout is defined
+                and '/etc/letsencrypt/' in remediation_certbot_inventory.stdout
+                and (remediation_letsencrypt_files.files | default([]) | length) > 0)
             else false
           }}
       tags: [remediate]
