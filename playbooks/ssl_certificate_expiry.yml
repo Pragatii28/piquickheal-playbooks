@@ -984,6 +984,11 @@
         tls_regenerated_count: 0
         tls_changes_made: false
 
+        tls_post_remediation_records: []
+        tls_post_expired_count: 0
+        tls_post_critical_count: 0
+        tls_post_expiring_count: 0
+
       tags:
         - always
         - diagnose
@@ -2319,6 +2324,41 @@
         - remediate
 
 
+    # --------------------------------------------------------
+    # Post-remediation counts, computed over the same
+    # population as the STAGE 15 pre-remediation counts (leaf
+    # certificates only, CAs excluded) so the two are directly
+    # comparable.
+    # --------------------------------------------------------
+
+    - name: STAGE 25 - Count remaining certificates by status
+      ansible.builtin.set_fact:
+        tls_post_expired_count: >-
+          {{
+            tls_post_remediation_records
+            | rejectattr('is_ca')
+            | selectattr('status', 'equalto', 'EXPIRED')
+            | list | length
+          }}
+        tls_post_critical_count: >-
+          {{
+            tls_post_remediation_records
+            | rejectattr('is_ca')
+            | selectattr('status', 'equalto', 'CRITICAL')
+            | list | length
+          }}
+        tls_post_expiring_count: >-
+          {{
+            tls_post_remediation_records
+            | rejectattr('is_ca')
+            | selectattr('status', 'equalto', 'EXPIRING_SOON')
+            | list | length
+          }}
+      tags:
+        - validate
+        - remediate
+
+
     - name: STAGE 25 - Determine validation status
       ansible.builtin.set_fact:
         tls_validation_status: >-
@@ -2343,15 +2383,61 @@
     # STAGE 26 - DETERMINE FINAL STATUS
     # ========================================================
 
-    - name: STAGE 26 - Determine final diagnosis status
+    # --------------------------------------------------------
+    # Two diagnoses are reported, because one value cannot
+    # honestly describe both what was found and what is left.
+    #
+    #   tls_diagnosis_status_initial - state at STAGE 5, before
+    #                                  anything was touched
+    #   tls_diagnosis_status         - state after remediation,
+    #                                  or the initial state when
+    #                                  remediation did not run
+    #
+    # tls_diagnosis_status is what gets published, so a healed
+    # host stops reporting CRITICAL to PiQuickHeal while the
+    # initial value is retained for the audit trail.
+    # --------------------------------------------------------
+
+    - name: STAGE 26 - Determine initial diagnosis status
       ansible.builtin.set_fact:
-        tls_diagnosis_status: >-
+        tls_diagnosis_status_initial: >-
           {{
             'CRITICAL'
             if tls_expired_certificates | length > 0
             else
             'WARNING'
             if tls_critical_certificates | length > 0
+            else
+            'HEALTHY'
+          }}
+      tags:
+        - diagnose
+        - remediate
+        - validate
+
+
+    - name: STAGE 26 - Determine post-remediation diagnosis status
+      ansible.builtin.set_fact:
+        tls_diagnosis_status: >-
+          {{
+            tls_diagnosis_status_initial
+            if (tls_post_remediation_records | default([]) | length) == 0
+            else
+            'CRITICAL'
+            if (
+              tls_post_remediation_records
+              | rejectattr('is_ca')
+              | selectattr('status', 'equalto', 'EXPIRED')
+              | list | length
+            ) > 0
+            else
+            'WARNING'
+            if (
+              tls_post_remediation_records
+              | rejectattr('is_ca')
+              | selectattr('status', 'equalto', 'CRITICAL')
+              | list | length
+            ) > 0
             else
             'HEALTHY'
           }}
@@ -2458,6 +2544,9 @@
 
           piquickheal_status: "{{ tls_diagnosis_status }}"
 
+          piquickheal_status_initial: >-
+            {{ tls_diagnosis_status_initial }}
+
           piquickheal_remediation_status: >-
             {{ tls_remediation_status }}
 
@@ -2497,6 +2586,12 @@
           piquickheal_regenerated_count: >-
             {{ tls_regenerated_count | default(0) }}
 
+          piquickheal_remaining_expired_count: >-
+            {{ tls_post_expired_count | default(0) }}
+
+          piquickheal_remaining_critical_count: >-
+            {{ tls_post_critical_count | default(0) }}
+
           piquickheal_selfsigned_results: >-
             {{ tls_selfsigned_results | default([]) }}
 
@@ -2521,25 +2616,65 @@
 
     - name: STAGE 29 - Display final summary
       ansible.builtin.debug:
-        msg:
-          - "============================================================"
-          - "PiQuickHeal TLS Certificate Health"
-          - "============================================================"
-          - "Host: {{ inventory_hostname }}"
-          - "Diagnosis: {{ tls_diagnosis_status }}"
-          - "Remediation: {{ tls_remediation_status }}"
-          - "Validation: {{ tls_validation_status }}"
-          - "Renewal mechanism: {{ tls_primary_renewal_mechanism }}"
-          - "Certificate files: {{ tls_certificate_candidates | length }}"
-          - "Leaf certificates: {{ tls_leaf_certificates | length }}"
-          - "CA certificates: {{ tls_ca_certificates | length }}"
-          - "Expired: {{ tls_expired_certificates | length }}"
-          - "Critical: {{ tls_critical_certificates | length }}"
-          - "Expiring soon: {{ tls_expiring_certificates | length }}"
-          - "Unparseable: {{ tls_unparseable_certificates | length }}"
-          - "Skipped files: {{ tls_skipped_certificates | default([]) | length }}"
-          - "Self-signed regenerated: {{ tls_regenerated_count | default(0) }}"
-          - "============================================================"
+        msg: >-
+          {{
+            [
+              'Host: ' ~ inventory_hostname,
+
+              'Diagnosis: ' ~ tls_diagnosis_status_initial ~ ' -> ' ~ tls_diagnosis_status
+              if tls_diagnosis_status != tls_diagnosis_status_initial
+              else 'Diagnosis: ' ~ tls_diagnosis_status,
+
+              'Remediation: ' ~ tls_remediation_status,
+
+              'Validation: ' ~ tls_validation_status,
+
+              'Regenerated: ' ~ tls_regenerated_count
+              if (tls_regenerated_count | int) > 0
+              else '',
+
+              'Certificates: ' ~ (tls_certificate_records | length)
+              ~ ' (' ~ (tls_leaf_certificates | length) ~ ' leaf, '
+              ~ (tls_ca_certificates | length) ~ ' CA)',
+
+              'Found before remediation: '
+              ~ (tls_expired_certificates | length) ~ ' expired, '
+              ~ (tls_critical_certificates | length) ~ ' critical, '
+              ~ (tls_expiring_certificates | length) ~ ' expiring soon'
+              if (
+                (tls_expired_certificates | length)
+                + (tls_critical_certificates | length)
+                + (tls_expiring_certificates | length)
+              ) > 0
+              else '',
+
+              'Remaining after remediation: '
+              ~ tls_post_expired_count ~ ' expired, '
+              ~ tls_post_critical_count ~ ' critical, '
+              ~ tls_post_expiring_count ~ ' expiring soon'
+              if (
+                (tls_post_remediation_records | default([]) | length) > 0
+                and (tls_remediation_required | default(false) | bool)
+              )
+              else '',
+
+              'Unparseable: ' ~ (tls_unparseable_certificates | length)
+              if (tls_unparseable_certificates | length) > 0
+              else '',
+
+              'Skipped files: ' ~ (tls_skipped_certificates | default([]) | length)
+              if (tls_skipped_certificates | default([]) | length) > 0
+              else '',
+
+              'Renewal mechanism: ' ~ tls_primary_renewal_mechanism,
+
+              'TLS ports: ' ~ (tls_candidate_ports | default([]) | join(', '))
+              if (tls_candidate_ports | default([]) | length) > 0
+              else 'TLS ports: none detected'
+            ]
+            | reject('equalto', '')
+            | list
+          }}
       tags:
         - diagnose
         - remediate
