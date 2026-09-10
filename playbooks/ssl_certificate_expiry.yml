@@ -61,9 +61,19 @@
 #   - CHANGED: certificate inspection moved from a nested shell/openssl loop
 #     (about 8 openssl processes per certificate) to a single Python pass with
 #     one openssl invocation per certificate.
-#   - CHANGED: discovery no longer walks the system CA trust store or vendored
-#     Python certifi/botocore bundles by default. Set
-#     tls_include_trust_stores=true to restore the old behaviour.
+#   - CHANGED: discovery no longer walks the system CA trust store, vendored
+#     Python certifi/botocore bundles, or the fwupd firmware-signing CAs by
+#     default. Set tls_include_trust_stores=true to restore the old behaviour.
+#   - FIXED: STAGE 25 reported PASSED on every run, because it compared the
+#     exit status of a shell loop that could not fail. It now re-inspects and
+#     reports NOT_RUN / NOT_REQUIRED / PASSED / FAILED.
+#   - FIXED: STAGE 21 started .timer units, which only arms the schedule and
+#     never runs the renewal. The matching .service units are now triggered.
+#   - ADDED: STAGE 21B regenerates self-signed leaf certificates, which no
+#     external mechanism can renew. Reuses the existing private key, backs up
+#     the original, and refuses anything it cannot handle confidently. Gated
+#     behind tls_allow_selfsigned_regeneration in addition to
+#     tls_allow_remediation, with a dry-run mode.
 # ============================================================
 
 - name: PiQuickHeal - Dynamic TLS SSL Certificate Health
@@ -103,6 +113,39 @@
     tls_max_certs_per_file: 50
 
     tls_inspector_path: /tmp/piquickheal_tls_inspect.py
+    tls_regen_path: /tmp/piquickheal_tls_regen.py
+
+    # --------------------------------------------------------
+    # Self-signed regeneration
+    #
+    # A CA-issued certificate cannot be regenerated locally:
+    # there is no issuer available to sign a replacement, and
+    # substituting a self-signed one would swap a trusted
+    # certificate for an untrusted one. So this path is limited
+    # to certificates that are already self-signed, and it sits
+    # behind its own flag in addition to tls_allow_remediation.
+    #
+    # Enable with:
+    #   -e tls_allow_remediation=true
+    #   -e tls_allow_selfsigned_regeneration=true
+    #
+    # tls_selfsigned_dry_run reports what would change without
+    # writing anything. Run that first.
+    # --------------------------------------------------------
+
+    tls_allow_selfsigned_regeneration: false
+
+    tls_selfsigned_dry_run: false
+
+    tls_selfsigned_validity_days: 397
+
+    # When no private key matching the certificate can be
+    # found, generate a new keypair rather than refusing.
+    #
+    # Off by default: a new key means every service and client
+    # pinned to the old key stops working, which is a bigger
+    # outage than an expired self-signed test certificate.
+    tls_selfsigned_allow_new_key: false
 
     # --------------------------------------------------------
     # Inspector source, deployed to the target in STAGE 4 and
@@ -380,6 +423,402 @@
           main()
 
     # --------------------------------------------------------
+    # Self-signed regeneration helper, deployed in STAGE 21B.
+    # --------------------------------------------------------
+
+    tls_regen_source: !unsafe |
+      #!/usr/bin/env python3
+      """
+      PiQuickHeal self-signed certificate regeneration.
+
+      Reads a JSON document on stdin:
+
+          {
+            "days": 397,
+            "dry_run": false,
+            "allow_new_key": false,
+            "targets": [{"path": "/etc/ssl/x.pem", "subject": "...", "san": "..."}]
+          }
+
+      and writes a JSON report to stdout.
+
+      Scope is deliberately narrow. This regenerates SELF-SIGNED certificates only.
+      It cannot and must not be used on CA-issued certificates: there is no issuer to
+      sign a replacement, so producing one would silently swap a trusted certificate
+      for an untrusted one.
+
+      Safety properties:
+        - The existing private key is reused, so anything referencing the key file
+          keeps working. A new key is generated only when allow_new_key is set.
+        - The key is confirmed to match the certificate before anything is written.
+        - The original file is copied to <path>.piquickheal-<timestamp>.bak with
+          mode, owner and group preserved.
+        - The replacement is written to a temporary file in the same directory and
+          moved into place, so a reading process never sees a partial file.
+        - Refusal is the default: any target that cannot be handled confidently is
+          reported as SKIPPED with a reason and left untouched.
+      """
+
+      import json
+      import os
+      import re
+      import shutil
+      import subprocess
+      import sys
+      import tempfile
+      import time
+
+      CERT_BLOCK = re.compile(
+          r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+          re.DOTALL,
+      )
+
+      KEY_BLOCK = re.compile(
+          r"-----BEGIN (?:RSA |EC |ENCRYPTED )?PRIVATE KEY-----"
+          r".*?"
+          r"-----END (?:RSA |EC |ENCRYPTED )?PRIVATE KEY-----",
+          re.DOTALL,
+      )
+
+      SAN_ENTRY = re.compile(r"(DNS|IP Address|email|URI):([^,]+)")
+
+
+      def openssl(args, stdin_data=None):
+          """Run openssl and return (rc, stdout_text)."""
+          try:
+              proc = subprocess.run(
+                  ["openssl"] + args,
+                  input=stdin_data,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  timeout=60,
+              )
+          except (OSError, subprocess.TimeoutExpired) as exc:
+              return 1, str(exc)
+          return proc.returncode, proc.stdout.decode("utf-8", "replace")
+
+
+      def read_text(path):
+          try:
+              with open(path, "r", errors="replace") as handle:
+                  return handle.read()
+          except OSError:
+              return ""
+
+
+      def cert_public_key(cert_pem):
+          rc, out = openssl(["x509", "-noout", "-pubkey"], cert_pem.encode())
+          return out.strip() if rc == 0 else None
+
+
+      def key_public_key(key_path):
+          rc, out = openssl(["pkey", "-in", key_path, "-pubout"])
+          return out.strip() if rc == 0 else None
+
+
+      def key_public_key_inline(key_pem):
+          rc, out = openssl(["pkey", "-pubout"], key_pem.encode())
+          return out.strip() if rc == 0 else None
+
+
+      def candidate_key_paths(cert_path):
+          """Conventional locations for the key belonging to a certificate."""
+          directory = os.path.dirname(cert_path)
+          base = os.path.basename(cert_path)
+          stem = os.path.splitext(base)[0]
+
+          names = [
+              stem + ".key",
+              stem + "-key.pem",
+              stem + ".key.pem",
+              stem + "_key.pem",
+              stem + ".pem",
+              base + ".key",
+          ]
+
+          paths = []
+          for directory_option in (directory, "/etc/ssl/private", "/etc/pki/tls/private"):
+              for name in names:
+                  candidate = os.path.join(directory_option, name)
+                  if candidate != cert_path and candidate not in paths:
+                      paths.append(candidate)
+          return paths
+
+
+      def locate_key(cert_path, cert_pem):
+          """
+          Return (kind, value) where kind is one of:
+            "inline" -> value is the key PEM found inside the certificate file
+            "file"   -> value is a path to a matching key file
+            None     -> nothing usable found
+          """
+          wanted = cert_public_key(cert_pem)
+          if not wanted:
+              return None, None
+
+          raw = read_text(cert_path)
+          inline = KEY_BLOCK.search(raw)
+          if inline:
+              key_pem = inline.group(0)
+              if "ENCRYPTED" in key_pem:
+                  return None, None
+              if key_public_key_inline(key_pem) == wanted:
+                  return "inline", key_pem
+
+          for candidate in candidate_key_paths(cert_path):
+              if not os.path.isfile(candidate):
+                  continue
+              if key_public_key(candidate) == wanted:
+                  return "file", candidate
+
+          return None, None
+
+
+      def subject_compat(cert_pem):
+          """Subject in /CN=x/O=y form, which is what `openssl req -subj` expects."""
+          rc, out = openssl(
+              ["x509", "-noout", "-nameopt", "compat", "-subject"], cert_pem.encode()
+          )
+          if rc != 0:
+              return None
+          line = out.strip()
+          if line.startswith("subject="):
+              line = line.split("=", 1)[1].strip()
+          if not line.startswith("/"):
+              return None
+          return line
+
+
+      def san_list(cert_pem):
+          rc, out = openssl(
+              ["x509", "-noout", "-ext", "subjectAltName"], cert_pem.encode()
+          )
+          if rc != 0:
+              return []
+          entries = []
+          for kind, value in SAN_ENTRY.findall(out):
+              value = value.strip()
+              if not value:
+                  continue
+              prefix = "IP" if kind == "IP Address" else kind
+              entry = prefix + ":" + value
+              if entry not in entries:
+                  entries.append(entry)
+          return entries
+
+
+      def backup(path, stamp):
+          target = "%s.piquickheal-%s.bak" % (path, stamp)
+          shutil.copy2(path, target)
+          try:
+              info = os.stat(path)
+              os.chown(target, info.st_uid, info.st_gid)
+          except (OSError, AttributeError):
+              pass
+          return target
+
+
+      def write_preserving(path, content):
+          """Atomic replace that keeps the original mode, owner and group."""
+          directory = os.path.dirname(path) or "."
+          try:
+              info = os.stat(path)
+              mode, uid, gid = info.st_mode & 0o7777, info.st_uid, info.st_gid
+          except OSError:
+              mode, uid, gid = 0o644, -1, -1
+
+          handle, temp_path = tempfile.mkstemp(dir=directory, prefix=".piquickheal-")
+          try:
+              with os.fdopen(handle, "w") as stream:
+                  stream.write(content)
+              os.chmod(temp_path, mode)
+              if uid != -1:
+                  try:
+                      os.chown(temp_path, uid, gid)
+                  except OSError:
+                      pass
+              os.replace(temp_path, path)
+          except Exception:
+              try:
+                  os.unlink(temp_path)
+              except OSError:
+                  pass
+              raise
+
+
+      def regenerate(cert_path, days, allow_new_key, dry_run, stamp):
+          raw = read_text(cert_path)
+          cert_match = CERT_BLOCK.search(raw)
+          if not cert_match:
+              return {"path": cert_path, "action": "SKIPPED", "reason": "NO_CERTIFICATE"}
+
+          if len(CERT_BLOCK.findall(raw)) > 1:
+              return {"path": cert_path, "action": "SKIPPED", "reason": "MULTI_CERT_FILE"}
+
+          cert_pem = cert_match.group(0)
+
+          rc, _ = openssl(["x509", "-noout", "-checkend", "0"], cert_pem.encode())
+          already_valid = rc == 0
+
+          subject = subject_compat(cert_pem)
+          if not subject:
+              return {"path": cert_path, "action": "SKIPPED", "reason": "NO_SUBJECT"}
+
+          kind, key = locate_key(cert_path, cert_pem)
+
+          generated_key = False
+          if kind is None:
+              if not allow_new_key:
+                  return {
+                      "path": cert_path,
+                      "action": "SKIPPED",
+                      "reason": "NO_MATCHING_PRIVATE_KEY",
+                      "searched": candidate_key_paths(cert_path)[:6],
+                  }
+              generated_key = True
+
+          sans = san_list(cert_pem)
+
+          result = {
+              "path": cert_path,
+              "subject": subject,
+              "san": sans,
+              "key_source": "generated" if generated_key else kind,
+              "key_path": key if kind == "file" else None,
+              "already_valid": already_valid,
+          }
+
+          if dry_run:
+              result["action"] = "WOULD_REGENERATE"
+              return result
+
+          workdir = tempfile.mkdtemp(prefix="piquickheal-regen-")
+          try:
+              key_path = os.path.join(workdir, "key.pem")
+              if generated_key:
+                  rc, _ = openssl(
+                      ["genpkey", "-algorithm", "RSA", "-pkeyopt",
+                       "rsa_keygen_bits:2048", "-out", key_path]
+                  )
+                  if rc != 0:
+                      result["action"] = "FAILED"
+                      result["reason"] = "KEY_GENERATION_FAILED"
+                      return result
+              elif kind == "inline":
+                  with open(key_path, "w") as stream:
+                      stream.write(key + "\n")
+              else:
+                  shutil.copyfile(key, key_path)
+
+              new_cert = os.path.join(workdir, "cert.pem")
+              args = [
+                  "req", "-x509", "-new",
+                  "-key", key_path,
+                  "-out", new_cert,
+                  "-days", str(days),
+                  "-sha256",
+                  "-subj", subject,
+                  "-addext", "basicConstraints=critical,CA:FALSE",
+              ]
+              if sans:
+                  args += ["-addext", "subjectAltName=" + ",".join(sans)]
+
+              rc, out = openssl(args)
+              if rc != 0 or not os.path.exists(new_cert):
+                  result["action"] = "FAILED"
+                  result["reason"] = "OPENSSL_REQ_FAILED"
+                  result["detail"] = out[-400:]
+                  return result
+
+              replacement = read_text(new_cert).strip() + "\n"
+
+              # Confirm the replacement is loadable and matches the key we used.
+              if cert_public_key(replacement) != key_public_key(key_path):
+                  result["action"] = "FAILED"
+                  result["reason"] = "KEY_MISMATCH_AFTER_GENERATION"
+                  return result
+
+              result["backup"] = backup(cert_path, stamp)
+
+              if kind == "inline":
+                  body = raw.replace(cert_pem, replacement.strip())
+              else:
+                  body = replacement
+
+              write_preserving(cert_path, body)
+
+              if generated_key:
+                  new_key_path = os.path.splitext(cert_path)[0] + ".piquickheal.key"
+                  shutil.copyfile(key_path, new_key_path)
+                  os.chmod(new_key_path, 0o600)
+                  result["new_key_path"] = new_key_path
+
+              rc, out = openssl(
+                  ["x509", "-in", cert_path, "-noout", "-enddate"]
+              )
+              result["new_not_after"] = out.strip().split("=", 1)[-1] if rc == 0 else ""
+              result["action"] = "REGENERATED"
+              return result
+          finally:
+              shutil.rmtree(workdir, ignore_errors=True)
+
+
+      def main():
+          try:
+              request = json.load(sys.stdin)
+          except ValueError as exc:
+              json.dump({"error": "BAD_INPUT", "detail": str(exc), "results": []}, sys.stdout)
+              sys.stdout.write("\n")
+              return
+
+          days = int(request.get("days", 397))
+          dry_run = bool(request.get("dry_run", False))
+          allow_new_key = bool(request.get("allow_new_key", False))
+          targets = request.get("targets") or []
+
+          stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+          results = []
+
+          for target in targets:
+              path = target.get("path") if isinstance(target, dict) else target
+              if not path:
+                  continue
+              if not os.path.isfile(path):
+                  results.append({"path": path, "action": "SKIPPED", "reason": "MISSING"})
+                  continue
+              try:
+                  results.append(
+                      regenerate(path, days, allow_new_key, dry_run, stamp)
+                  )
+              except Exception as exc:
+                  results.append(
+                      {
+                          "path": path,
+                          "action": "FAILED",
+                          "reason": "EXCEPTION",
+                          "detail": str(exc),
+                      }
+                  )
+
+          json.dump(
+              {
+                  "stamp": stamp,
+                  "dry_run": dry_run,
+                  "target_count": len(targets),
+                  "regenerated": len(
+                      [r for r in results if r.get("action") == "REGENERATED"]
+                  ),
+                  "results": results,
+              },
+              sys.stdout,
+          )
+          sys.stdout.write("\n")
+
+
+      if __name__ == "__main__":
+          main()
+
+    # --------------------------------------------------------
     # Certificate discovery paths
     #
     # These are roots, not individual certificate files.
@@ -523,6 +962,11 @@
         tls_skipped_certificates: []
         tls_unparseable_certificates: []
         tls_candidate_ports: []
+
+        tls_selfsigned_targets: []
+        tls_selfsigned_results: []
+        tls_regenerated_count: 0
+        tls_changes_made: false
 
       tags:
         - always
@@ -1513,10 +1957,17 @@
     # STAGE 21 - SYSTEMD REMEDIATION
     # ========================================================
 
-    - name: STAGE 21 - Start detected certificate renewal timers
+    # --------------------------------------------------------
+    # Starting a .timer only arms the schedule, it does not run
+    # the job, so the previous task could never trigger a
+    # renewal. The matching .service is what performs the work.
+    # --------------------------------------------------------
+
+    - name: STAGE 21 - Ensure renewal timers are enabled
       ansible.builtin.systemd:
         name: "{{ item }}"
         state: started
+        enabled: true
       loop: "{{ tls_systemd_timers.stdout_lines | default([]) }}"
       register: tls_systemd_timer_start
       failed_when: false
@@ -1524,6 +1975,166 @@
         - tls_allow_remediation | bool
         - tls_remediation_required | bool
         - tls_primary_renewal_mechanism == "SYSTEMD"
+      tags:
+        - remediate
+
+
+    - name: STAGE 21 - Trigger detected renewal services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: restarted
+      loop: "{{ tls_systemd_services.stdout_lines | default([]) }}"
+      register: tls_systemd_service_run
+      failed_when: false
+      when:
+        - tls_allow_remediation | bool
+        - tls_remediation_required | bool
+        - tls_primary_renewal_mechanism == "SYSTEMD"
+      tags:
+        - remediate
+
+
+    # ========================================================
+    # STAGE 21B - SELF-SIGNED REGENERATION
+    #
+    # For certificates no external mechanism can renew.
+    #
+    # Targets must satisfy ALL of:
+    #   - leaf (not a CA certificate)
+    #   - self-signed
+    #   - provider detected as SELF_SIGNED
+    #   - status EXPIRED or CRITICAL
+    #
+    # The existing private key is reused and the original file
+    # is backed up. Anything that cannot be handled with
+    # confidence is skipped with a reason rather than guessed at.
+    # ========================================================
+
+    - name: STAGE 21B - Select self-signed regeneration targets
+      ansible.builtin.set_fact:
+        tls_selfsigned_targets: >-
+          {{
+            tls_certificate_records
+            | rejectattr('is_ca')
+            | selectattr('self_signed')
+            | selectattr('provider', 'equalto', 'SELF_SIGNED')
+            | selectattr('status', 'in', ['EXPIRED', 'CRITICAL'])
+            | map(attribute='path')
+            | unique
+            | list
+          }}
+      tags:
+        - remediate
+
+
+    - name: STAGE 21B - Report regeneration scope
+      ansible.builtin.debug:
+        msg: >-
+          {{ tls_selfsigned_targets | length }} self-signed certificate(s)
+          eligible for regeneration
+          {{
+            '(regeneration disabled)'
+            if not (tls_allow_selfsigned_regeneration | bool)
+            else '(dry run)'
+            if (tls_selfsigned_dry_run | bool)
+            else '(will be rewritten)'
+          }}.
+      tags:
+        - remediate
+
+
+    - name: STAGE 21B - Deploy regeneration helper
+      ansible.builtin.copy:
+        dest: "{{ tls_regen_path }}"
+        mode: "0700"
+        owner: root
+        group: root
+        content: "{{ tls_regen_source }}"
+      when:
+        - tls_allow_remediation | bool
+        - tls_allow_selfsigned_regeneration | bool
+        - tls_selfsigned_targets | length > 0
+      tags:
+        - remediate
+
+
+    - name: STAGE 21B - Regenerate self-signed certificates
+      ansible.builtin.command:
+        cmd: "{{ tls_regen_path }}"
+        stdin: >-
+          {{
+            {
+              'days': tls_selfsigned_validity_days | int,
+              'dry_run': tls_selfsigned_dry_run | bool,
+              'allow_new_key': tls_selfsigned_allow_new_key | bool,
+              'targets': tls_selfsigned_targets
+            }
+            | to_json
+          }}
+      register: tls_selfsigned_run
+      changed_when: false
+      failed_when: false
+      when:
+        - tls_allow_remediation | bool
+        - tls_allow_selfsigned_regeneration | bool
+        - tls_selfsigned_targets | length > 0
+      tags:
+        - remediate
+
+
+    - name: STAGE 21B - Remove regeneration helper
+      ansible.builtin.file:
+        path: "{{ tls_regen_path }}"
+        state: absent
+      failed_when: false
+      tags:
+        - remediate
+
+
+    - name: STAGE 21B - Parse regeneration results
+      ansible.builtin.set_fact:
+        tls_selfsigned_results: >-
+          {{
+            (
+              tls_selfsigned_run.stdout | default('') | trim | from_json
+            ).results
+            | default([])
+            if (
+              (tls_selfsigned_run.rc | default(1)) == 0
+              and (tls_selfsigned_run.stdout | default('') | trim | length) > 0
+            )
+            else []
+          }}
+      tags:
+        - remediate
+
+
+    - name: STAGE 21B - Count regenerated certificates
+      ansible.builtin.set_fact:
+        tls_regenerated_count: >-
+          {{
+            tls_selfsigned_results
+            | selectattr('action', 'equalto', 'REGENERATED')
+            | list
+            | length
+          }}
+        tls_changes_made: >-
+          {{
+            (
+              tls_selfsigned_results
+              | selectattr('action', 'equalto', 'REGENERATED')
+              | list
+              | length
+            ) > 0
+          }}
+      tags:
+        - remediate
+
+
+    - name: STAGE 21B - Report regeneration outcome
+      ansible.builtin.debug:
+        msg: "{{ tls_selfsigned_results }}"
+      when: tls_selfsigned_results | length > 0
       tags:
         - remediate
 
@@ -1802,6 +2413,9 @@
           Skipped:
           {{ tls_skipped_certificates | default([]) | to_nice_json }}
 
+          Self-Signed Regeneration:
+          {{ tls_selfsigned_results | default([]) | to_nice_json }}
+
           Findings:
           {{ tls_findings | to_nice_json }}
 
@@ -1864,6 +2478,12 @@
           piquickheal_candidate_file_count: >-
             {{ tls_certificate_candidates | length }}
 
+          piquickheal_regenerated_count: >-
+            {{ tls_regenerated_count | default(0) }}
+
+          piquickheal_selfsigned_results: >-
+            {{ tls_selfsigned_results | default([]) }}
+
           piquickheal_findings: >-
             {{ tls_findings }}
 
@@ -1902,6 +2522,7 @@
           - "Expiring soon: {{ tls_expiring_certificates | length }}"
           - "Unparseable: {{ tls_unparseable_certificates | length }}"
           - "Skipped files: {{ tls_skipped_certificates | default([]) | length }}"
+          - "Self-signed regenerated: {{ tls_regenerated_count | default(0) }}"
           - "============================================================"
       tags:
         - diagnose
