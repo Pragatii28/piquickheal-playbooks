@@ -147,7 +147,7 @@
             certificate_files.files | default([])
             | map(attribute='path')
             | list
-            | reject('regex_search', certificate_exclude_path_patterns | join('|'))
+            | reject('search', certificate_exclude_path_patterns | join('|'))
             | list
           }}
       tags: [diagnose]
