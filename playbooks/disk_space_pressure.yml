@@ -100,16 +100,11 @@
 
     # Optional notification about the top disk consumer found during
     # diagnosis. The diagnosis output ALWAYS explains this (see [8]
-    # ACTION REQUIRED above) with no configuration needed - these vars
-    # only control whether that same information is ALSO pushed out via
-    # email and/or a webhook (e.g. Slack, Teams, ServiceNow). Off by
-    # default so nothing fails on hosts without mail/webhook access.
+    # ACTION REQUIRED above) with no configuration needed - this var
+    # only controls whether that same information is ALSO pushed out
+    # via a webhook (e.g. Slack, Teams, ServiceNow). Off by default so
+    # nothing fails on hosts without webhook access.
     notify_enabled: false
-    notify_method: email   # email, webhook, or both
-    notify_email_to: ""
-    notify_email_from: "piquickheal@{{ inventory_hostname }}"
-    smtp_host: localhost
-    smtp_port: 25
     notify_webhook_url: ""
 
   tasks:
@@ -386,42 +381,6 @@
     # NOTIFY ABOUT TOP CONSUMER (OPTIONAL - off unless notify_enabled)
     # ============================================================
 
-    - name: "STAGE 1 - Email notification about top disk consumer"
-      ansible.builtin.mail:
-        host: "{{ smtp_host }}"
-        port: "{{ smtp_port }}"
-        to: "{{ notify_email_to }}"
-        from: "{{ notify_email_from }}"
-        subject: >-
-          [PiQuickHeal] {{ inventory_hostname }} disk at {{ disk_used_pct }}% - review required
-        body: |
-          PiQuickHeal disk space diagnosis for {{ inventory_hostname }} (mount {{ mount_path }}):
-
-          Disk used         : {{ disk_used_pct }}%
-          Top consumer      : {{ top_consumer_path }}
-          Size              : {{ top_consumer_size_mb }}MB
-          Excluded from automation (protected path): {{ disk_mount_protected }}
-
-          Automated remediation, if approved, will ONLY ever:
-            - delete rotated/compressed logs older than {{ log_retention_days }} days
-              under the configured log_search_paths
-            - clear package manager caches
-            - clear stale entries under /tmp and /var/tmp
-            - as a last resort, truncate the largest eligible *.log file
-
-          It will NOT delete the item shown above. Please check whether it
-          is still needed. If not, remove it manually to free space; if
-          unsure, investigate before taking any action.
-
-      when:
-        - notify_enabled | default(false) | bool
-        - notify_method in ['email', 'both']
-        - notify_email_to | length > 0
-
-      tags:
-        - diagnose
-
-
     - name: "STAGE 1 - Webhook notification about top disk consumer"
       ansible.builtin.uri:
         url: "{{ notify_webhook_url }}"
@@ -441,7 +400,6 @@
 
       when:
         - notify_enabled | default(false) | bool
-        - notify_method in ['webhook', 'both']
         - notify_webhook_url | length > 0
 
       tags:
