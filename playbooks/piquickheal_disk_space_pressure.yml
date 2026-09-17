@@ -17,16 +17,6 @@
 # the mount point reported by the disk-usage alert (defaults to "/" when the
 # alert did not name a specific mount).
 #
-# CHANGE LOG (this revision):
-#   Stage 1 no longer picks the mount point itself as the "top consumer"
-#   (du always reports the mount as its own largest line, since it is the
-#   sum of everything under it -- the old logic never got past that line).
-#   It now walks down: find the largest immediate child of mount_path: if
-#   that child is a directory, descend into it and repeat; once the
-#   largest immediate child is a FILE, that file is reported as the true
-#   top consumer. The protected-path check then runs against that file's
-#   full path, so nesting depth no longer matters for detection.
-#
 # AWX:
 # Use the Limit field to select a specific host.
 
@@ -63,12 +53,54 @@
       - /boot
       - /etc
       - /root
+      # Full audit trail directory - protected by default so Stage 1
+      # never treats it as a safe top consumer and Stage 3 never
+      # truncates anything inside it, with no extra config required.
+      - /var/log/audit
 
     heal_log_path: /var/log/piquickheal/heal.log
 
     # Safety cap on how many levels the drill-down will descend, in case
     # of unexpectedly deep or cyclical (symlinked) directory trees.
     drilldown_max_depth: 25
+
+    # STAGE 2 rotated-log cleanup is scoped ONLY to these directories -
+    # never to the whole mount. Without this restriction, any *.gz file
+    # anywhere on disk (installed man pages, package data, font files,
+    # etc.) older than log_retention_days would be deleted, not just
+    # actual rotated application logs. Add application-specific log
+    # directories here if they live outside /var/log.
+    log_search_paths:
+      - /var/log
+
+    # Filename GLOB patterns (matched against the base filename only,
+    # not the full path) that must never be deleted by Stage 2 or
+    # selected as a truncation target by Stage 3, no matter how old or
+    # how large. Pre-populated with common security/audit filenames so
+    # this protection applies by default, with nothing to configure.
+    # Add anything else specific to your environment (compliance logs,
+    # in-house naming conventions, etc.).
+    critical_log_patterns:
+      - secure
+      - auth.log
+      - wtmp
+      - btmp
+      - lastlog
+      - utmp
+
+    # Optional notification about the top disk consumer found during
+    # diagnosis. The diagnosis output ALWAYS explains this (see [8]
+    # ACTION REQUIRED above) with no configuration needed - these vars
+    # only control whether that same information is ALSO pushed out via
+    # email and/or a webhook (e.g. Slack, Teams, ServiceNow). Off by
+    # default so nothing fails on hosts without mail/webhook access.
+    notify_enabled: false
+    notify_method: email   # email, webhook, or both
+    notify_email_to: ""
+    notify_email_from: "piquickheal@{{ inventory_hostname }}"
+    smtp_host: localhost
+    smtp_port: 25
+    notify_webhook_url: ""
 
   tasks:
 
@@ -237,6 +269,33 @@
         fi
 
         echo ""
+        echo "[8] ACTION REQUIRED - REVIEW BEFORE APPROVING REMEDIATION"
+        echo "------------------------------------------------------------"
+        echo "The single largest item found is:"
+        echo ""
+        echo "    $TOP_PATH  (${TOP_SIZE_MB:-0}MB)"
+        echo ""
+        echo "Automated remediation, if approved, will ONLY ever:"
+        echo "  - delete rotated/compressed logs under the configured"
+        echo "    log_search_paths that are older than {{ log_retention_days }} days"
+        echo "  - clear package manager caches"
+        echo "  - clear stale entries under /tmp and /var/tmp"
+        echo "  - as a last resort, truncate the largest eligible *.log file"
+        echo "    (never the file above, unless it happens to be that log)"
+        echo ""
+        echo "It will NOT delete the file or directory shown above."
+        echo "A human needs to look at it and decide:"
+        echo "  - is this file still needed"
+        echo "  - if not, delete it manually to free space"
+        echo "  - if unsure, investigate before taking any action"
+
+        echo ""
+        echo "DISK_USED_PCT:${USED_PCT:-0}"
+        echo "TOP_CONSUMER_PATH:${TOP_PATH:-unknown}"
+        echo "TOP_CONSUMER_SIZE_MB:${TOP_SIZE_MB:-0}"
+        echo "TOP_CONSUMER_PROTECTED:${IS_PROTECTED}"
+
+        echo ""
         echo "============================================================"
         echo "        END OF DISK SPACE PRESSURE DIAGNOSIS"
         echo "============================================================"
@@ -277,6 +336,26 @@
 
 
     # ============================================================
+    # EXTRACT TOP CONSUMER DETAILS FOR NOTIFICATION
+    # ============================================================
+
+    - name: "STAGE 1 - Extract top consumer details"
+      ansible.builtin.set_fact:
+        disk_used_pct: >-
+          {{ ((diagnose_result.stdout_lines | select('match', '^DISK_USED_PCT:') | list | first)
+              | default('DISK_USED_PCT:0', true)).split(':', 1)[1] }}
+        top_consumer_path: >-
+          {{ ((diagnose_result.stdout_lines | select('match', '^TOP_CONSUMER_PATH:') | list | first)
+              | default('TOP_CONSUMER_PATH:unknown', true)).split(':', 1)[1] }}
+        top_consumer_size_mb: >-
+          {{ ((diagnose_result.stdout_lines | select('match', '^TOP_CONSUMER_SIZE_MB:') | list | first)
+              | default('TOP_CONSUMER_SIZE_MB:0', true)).split(':', 1)[1] }}
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
     # PUBLISH DIAGNOSIS
     # ============================================================
 
@@ -285,6 +364,75 @@
         data:
           disk_mount_protected: "{{ disk_mount_protected }}"
           diagnostic_output: "{{ diagnose_result.stdout }}"
+          disk_used_pct: "{{ disk_used_pct }}"
+          top_consumer_path: "{{ top_consumer_path }}"
+          top_consumer_size_mb: "{{ top_consumer_size_mb }}"
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # NOTIFY ABOUT TOP CONSUMER (OPTIONAL - off unless notify_enabled)
+    # ============================================================
+
+    - name: "STAGE 1 - Email notification about top disk consumer"
+      ansible.builtin.mail:
+        host: "{{ smtp_host }}"
+        port: "{{ smtp_port }}"
+        to: "{{ notify_email_to }}"
+        from: "{{ notify_email_from }}"
+        subject: >-
+          [PiQuickHeal] {{ inventory_hostname }} disk at {{ disk_used_pct }}% - review required
+        body: |
+          PiQuickHeal disk space diagnosis for {{ inventory_hostname }} (mount {{ mount_path }}):
+
+          Disk used         : {{ disk_used_pct }}%
+          Top consumer      : {{ top_consumer_path }}
+          Size              : {{ top_consumer_size_mb }}MB
+          Excluded from automation (protected path): {{ disk_mount_protected }}
+
+          Automated remediation, if approved, will ONLY ever:
+            - delete rotated/compressed logs older than {{ log_retention_days }} days
+              under the configured log_search_paths
+            - clear package manager caches
+            - clear stale entries under /tmp and /var/tmp
+            - as a last resort, truncate the largest eligible *.log file
+
+          It will NOT delete the item shown above. Please check whether it
+          is still needed. If not, remove it manually to free space; if
+          unsure, investigate before taking any action.
+
+      when:
+        - notify_enabled | default(false) | bool
+        - notify_method in ['email', 'both']
+        - notify_email_to | length > 0
+
+      tags:
+        - diagnose
+
+
+    - name: "STAGE 1 - Webhook notification about top disk consumer"
+      ansible.builtin.uri:
+        url: "{{ notify_webhook_url }}"
+        method: POST
+        body_format: json
+        body:
+          host: "{{ inventory_hostname }}"
+          mount: "{{ mount_path }}"
+          disk_used_pct: "{{ disk_used_pct }}"
+          top_consumer_path: "{{ top_consumer_path }}"
+          top_consumer_size_mb: "{{ top_consumer_size_mb }}"
+          protected: "{{ disk_mount_protected }}"
+          message: >-
+            Top consumer {{ top_consumer_path }} ({{ top_consumer_size_mb }}MB)
+            requires manual review. Automated remediation will not delete it.
+        status_code: [200, 201, 202, 204]
+
+      when:
+        - notify_enabled | default(false) | bool
+        - notify_method in ['webhook', 'both']
+        - notify_webhook_url | length > 0
 
       tags:
         - diagnose
@@ -311,10 +459,55 @@
         echo "[1] REMOVING ROTATED/COMPRESSED LOGS OLDER THAN {{ log_retention_days }} DAYS"
         echo "------------------------------------------------------------"
 
-        find "$MOUNT" -xdev -type f \
-          \( -name "*.gz" -o -name "*.log.[0-9]*" -o -name "*.log.old" \) \
-          -mtime "+{{ log_retention_days }}" \
-          -print -delete 2>/dev/null || true
+        LOG_DIRS='{{ log_search_paths | join(" ") }}'
+        CRITICAL='{{ critical_log_patterns | join(" ") }}'
+
+        for D in $LOG_DIRS; do
+
+          if [ ! -d "$D" ]; then
+            echo "Skipping $D (does not exist on this host)"
+            continue
+          fi
+
+          case "$D" in
+            "$MOUNT"|"$MOUNT"/*)
+              # $D is on the mount being remediated - safe to consider.
+              # Walk candidates one at a time (instead of find -delete)
+              # so each filename can be checked against CRITICAL first.
+              while IFS= read -r F; do
+
+                [ -z "$F" ] && continue
+
+                BASE=$(basename "$F")
+                IS_CRITICAL=false
+
+                for PAT in $CRITICAL; do
+                  case "$BASE" in
+                    $PAT)
+                      IS_CRITICAL=true
+                      break
+                      ;;
+                  esac
+                done
+
+                if [ "$IS_CRITICAL" = true ]; then
+                  echo "Preserving critical log (matched pattern): $F"
+                  continue
+                fi
+
+                echo "$F"
+                rm -f "$F"
+
+              done < <(find "$D" -xdev -type f \
+                \( -name "*.gz" -o -name "*.log.[0-9]*" -o -name "*.log.old" \) \
+                -mtime "+{{ log_retention_days }}" 2>/dev/null)
+              ;;
+            *)
+              echo "Skipping $D (not under mount $MOUNT)"
+              ;;
+          esac
+
+        done
 
         echo ""
         echo "[2] CLEARING PACKAGE MANAGER CACHES"
@@ -410,11 +603,38 @@
         echo "------------------------------------------------------------"
 
         PROTECTED='{{ protected_paths | join(" ") }}'
+        LOG_DIRS='{{ log_search_paths | join(" ") }}'
+        CRITICAL='{{ critical_log_patterns | join(" ") }}'
+
+        # Collect *.log candidates only from log_search_paths that exist
+        # and sit under the mount being remediated - never the whole
+        # filesystem, so a stray *.log file outside real log directories
+        # can never become a truncation target.
+        FIND_OUTPUT=""
+
+        for D in $LOG_DIRS; do
+
+          if [ ! -d "$D" ]; then
+            continue
+          fi
+
+          case "$D" in
+            "$MOUNT"|"$MOUNT"/*)
+              FIND_OUTPUT="$FIND_OUTPUT
+        $(find "$D" -xdev -type f -name "*.log" -printf "%s %p\n" 2>/dev/null)"
+              ;;
+          esac
+
+        done
 
         TARGET=""
         TARGET_SIZE=0
 
         while read -r SIZE PATH; do
+
+          if [ -z "$PATH" ]; then
+            continue
+          fi
 
           IS_PROTECTED=false
 
@@ -427,18 +647,30 @@
             esac
           done
 
-          if [ "$IS_PROTECTED" = false ]; then
+          IS_CRITICAL=false
+          BASE=$(basename "$PATH")
+
+          for PAT in $CRITICAL; do
+            case "$BASE" in
+              $PAT)
+                IS_CRITICAL=true
+                break
+                ;;
+            esac
+          done
+
+          if [ "$IS_PROTECTED" = false ] && [ "$IS_CRITICAL" = false ]; then
             TARGET="$PATH"
             TARGET_SIZE="$SIZE"
             break
           fi
 
         done <<EOF
-        $(find "$MOUNT" -xdev -type f -name "*.log" -printf '%s %p\n' 2>/dev/null | sort -rn)
+        $(echo "$FIND_OUTPUT" | sort -rn)
         EOF
 
         if [ -z "$TARGET" ]; then
-          echo "No non-protected log file found to truncate."
+          echo "No non-protected, non-critical log file found to truncate."
           echo "REMEDIATION_STATUS: NOT_REQUIRED"
           exit 0
         fi
@@ -447,7 +679,24 @@
         echo "Size (B)   : $TARGET_SIZE"
 
         echo ""
-        echo "[2] TRUNCATION ACTION"
+        echo "[2] BACKING UP FULL ORIGINAL BEFORE TRUNCATION"
+        echo "------------------------------------------------------------"
+
+        BACKUP_DIR="$(dirname "{{ heal_log_path }}")/truncated_backups"
+        mkdir -p "$BACKUP_DIR"
+
+        TARGET_BASE=$(basename "$TARGET")
+        STAMP=$(date +%Y%m%d-%H%M%S)
+        BACKUP_FILE="$BACKUP_DIR/${TARGET_BASE}.${STAMP}.full.gz"
+
+        if gzip -c "$TARGET" > "$BACKUP_FILE" 2>/dev/null; then
+          echo "Full original preserved at: $BACKUP_FILE"
+        else
+          echo "WARNING: could not write backup - proceeding with truncation anyway"
+        fi
+
+        echo ""
+        echo "[3] TRUNCATION ACTION"
         echo "------------------------------------------------------------"
 
         echo "Truncating $TARGET to last {{ truncate_tail_lines }} lines..."
