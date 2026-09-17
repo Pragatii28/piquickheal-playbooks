@@ -1,0 +1,493 @@
+---
+# PiQuickHeal - High Load Average Diagnosis and Remediation
+#
+# AWX Job Templates:
+#
+# 1. piquickheal-high_load_average-diagnose
+#    Job Tags: diagnose
+#
+# 2. piquickheal-high_load_average-remediate
+#    Job Tags: remediate,validate
+#
+# Workflow:
+#
+# Diagnose → Approval → Remediate → Validate
+#
+# Unlike cpu_spike.yml (a single hot process), this targets load driven by
+# process *count*: zombies piling up because a parent isn't reaping them,
+# and/or one non-protected command spawned far more times than expected.
+# Uninterruptible-sleep (D-state) processes are diagnosis-only findings —
+# they are typically stuck on I/O and SIGKILL cannot remove them, so this
+# playbook never signals a D-state process.
+#
+# AWX:
+# Use the Limit field to select a specific host.
+
+- name: PiQuickHeal - High Load Average
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+
+    # Target load-average-per-core, below which the host is considered
+    # recovered.
+    load_recover_threshold_per_core: 1.0
+
+    # A non-protected command running at least this many times is treated
+    # as a runaway/fork-bomb-style condition.
+    runaway_instance_threshold: 20
+
+    # At most this many of the newest runaway instances are signaled per
+    # run, to avoid a single pass killing an entire process tree at once.
+    runaway_kill_batch_size: 5
+
+    protected_processes:
+      - systemd
+      - init
+      - sshd
+      - ssh
+      - NetworkManager
+      - dbus-daemon
+      - dockerd
+      - containerd
+      - mysqld
+      - postgres
+      - postgresql
+      - nginx
+      - httpd
+
+    heal_log_path: /var/log/piquickheal/heal.log
+
+  tasks:
+
+    # ============================================================
+    # STAGE 1: DIAGNOSE
+    # ============================================================
+
+    - name: "STAGE 1 - Diagnose load average, zombies and D-state processes"
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        echo "============================================================"
+        echo "        PIQUICKHEAL - HIGH LOAD AVERAGE DIAGNOSIS"
+        echo "============================================================"
+
+        echo ""
+        echo "[1] LOAD AVERAGE AND CORE COUNT"
+        echo "------------------------------------------------------------"
+
+        uptime
+
+        LOAD1=$(awk '{print $1}' /proc/loadavg)
+        CORES=$(nproc)
+        LOAD_PER_CORE=$(awk -v l="$LOAD1" -v c="$CORES" 'BEGIN { printf "%.2f", l / c }')
+
+        echo "Load (1m)      : $LOAD1"
+        echo "Cores          : $CORES"
+        echo "Load per core  : $LOAD_PER_CORE"
+
+        echo ""
+        echo "[2] ZOMBIE PROCESSES"
+        echo "------------------------------------------------------------"
+
+        ps -eo pid=,ppid=,stat=,comm= | awk '$3 ~ /^Z/' > /tmp/piquickheal_zombies.$$  || true
+        ZOMBIE_COUNT=$(wc -l < /tmp/piquickheal_zombies.$$)
+
+        echo "Zombie count: $ZOMBIE_COUNT"
+        cat /tmp/piquickheal_zombies.$$
+        rm -f /tmp/piquickheal_zombies.$$
+
+        echo ""
+        echo "[3] UNINTERRUPTIBLE SLEEP (D-STATE) PROCESSES"
+        echo "------------------------------------------------------------"
+
+        ps -eo pid=,ppid=,stat=,comm= | awk '$3 ~ /^D/' > /tmp/piquickheal_dstate.$$ || true
+        DSTATE_COUNT=$(wc -l < /tmp/piquickheal_dstate.$$)
+
+        echo "D-state count: $DSTATE_COUNT"
+        cat /tmp/piquickheal_dstate.$$
+        rm -f /tmp/piquickheal_dstate.$$
+
+        echo ""
+        echo "[4] MOST DUPLICATED COMMAND (RUNAWAY CANDIDATE)"
+        echo "------------------------------------------------------------"
+
+        TOP_DUP_LINE=$(ps -eo comm= | sort | uniq -c | sort -rn | head -n 1)
+        TOP_DUP_COUNT=$(echo "$TOP_DUP_LINE" | awk '{print $1}')
+        TOP_DUP_NAME=$(echo "$TOP_DUP_LINE" | awk '{print $2}')
+
+        echo "Command  : ${TOP_DUP_NAME:-UNKNOWN}"
+        echo "Instances: ${TOP_DUP_COUNT:-0}"
+
+        echo ""
+        echo "[5] PROTECTED PROCESS CHECK"
+        echo "------------------------------------------------------------"
+
+        PROTECTED='{{ protected_processes | join(" ") }}'
+
+        IS_PROTECTED=false
+
+        for P in $PROTECTED; do
+          if [ "$TOP_DUP_NAME" = "$P" ]; then
+            IS_PROTECTED=true
+            break
+          fi
+        done
+
+        echo ""
+        echo "[6] RESULT"
+        echo "------------------------------------------------------------"
+
+        echo "LOAD_PER_CORE:${LOAD_PER_CORE}"
+        echo "ZOMBIE_COUNT:${ZOMBIE_COUNT}"
+        echo "DSTATE_COUNT:${DSTATE_COUNT}"
+
+        if [ "$IS_PROTECTED" = true ]; then
+
+          echo "============================================================"
+          echo "RESULT: PROTECTED PROCESS"
+          echo "============================================================"
+
+          echo "Protected Name : $TOP_DUP_NAME"
+          echo "Instances      : $TOP_DUP_COUNT"
+          echo "ACTION         : NO AUTOMATIC RUNAWAY REMEDIATION"
+
+          echo ""
+          echo "PROTECTED_PROCESS_FOUND:${TOP_DUP_NAME} COUNT:${TOP_DUP_COUNT}"
+
+        elif [ "${TOP_DUP_COUNT:-0}" -ge {{ runaway_instance_threshold }} ]; then
+
+          echo "============================================================"
+          echo "RESULT: RUNAWAY PROCESS CANDIDATE"
+          echo "============================================================"
+
+          echo "Command   : $TOP_DUP_NAME"
+          echo "Instances : $TOP_DUP_COUNT"
+          echo "ACTION    : REMEDIATION MAY BE PROPOSED"
+
+          echo ""
+          echo "Top_process_not_protected:${TOP_DUP_NAME} COUNT:${TOP_DUP_COUNT}"
+
+        else
+
+          echo "============================================================"
+          echo "RESULT: NO RUNAWAY COMMAND ABOVE THRESHOLD"
+          echo "============================================================"
+          echo "ACTION : ZOMBIE REAPING ONLY (IF ANY)"
+
+        fi
+
+        echo ""
+        echo "============================================================"
+        echo "        END OF HIGH LOAD AVERAGE DIAGNOSIS"
+        echo "============================================================"
+
+      args:
+        executable: /bin/bash
+
+      register: diagnose_result
+      changed_when: false
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # DISPLAY DIAGNOSIS OUTPUT
+    # ============================================================
+
+    - name: "STAGE 1 - Show complete diagnosis output"
+      ansible.builtin.debug:
+        var: diagnose_result.stdout_lines
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # CHECK PROTECTED PROCESS / RUNAWAY CANDIDATE
+    # ============================================================
+
+    - name: "STAGE 1 - Determine whether the runaway candidate is protected"
+      ansible.builtin.set_fact:
+        load_runaway_protected: >-
+          {{ 'PROTECTED_PROCESS_FOUND' in diagnose_result.stdout }}
+
+      tags:
+        - diagnose
+
+
+    - name: "STAGE 1 - Determine whether a runaway candidate exists"
+      ansible.builtin.set_fact:
+        load_runaway_candidate: >-
+          {{ 'Top_process_not_protected' in diagnose_result.stdout }}
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # PUBLISH DIAGNOSIS
+    # ============================================================
+
+    - name: "STAGE 1 - Publish diagnosis result"
+      ansible.builtin.set_stats:
+        data:
+          load_runaway_protected: "{{ load_runaway_protected }}"
+          load_runaway_candidate: "{{ load_runaway_candidate }}"
+          diagnostic_output: "{{ diagnose_result.stdout }}"
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # STAGE 2: REAP ZOMBIES
+    # ============================================================
+
+    - name: "STAGE 2 - Reap zombies by signaling their parents"
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        echo "============================================================"
+        echo "        PIQUICKHEAL - HIGH LOAD AVERAGE REMEDIATION"
+        echo "        STAGE 2: REAP ZOMBIES"
+        echo "============================================================"
+
+        PROTECTED='{{ protected_processes | join(" ") }}'
+        REAPED=0
+
+        ps -eo pid=,ppid=,stat=,comm= | awk '$3 ~ /^Z/' | while read -r PID PPID STAT COMM; do
+
+          PARENT_NAME=$(ps -o comm= -p "$PPID" 2>/dev/null)
+
+          IS_PROTECTED=false
+          for P in $PROTECTED; do
+            if [ "$PARENT_NAME" = "$P" ]; then
+              IS_PROTECTED=true
+              break
+            fi
+          done
+
+          if [ "$IS_PROTECTED" = true ]; then
+            echo "Skipping zombie PID $PID: parent $PARENT_NAME ($PPID) is protected"
+            continue
+          fi
+
+          echo "Signaling parent PID $PPID ($PARENT_NAME) to reap zombie PID $PID"
+          kill -CHLD "$PPID" 2>/dev/null || true
+
+        done
+
+        sleep 2
+
+        REMAINING=$(ps -eo stat= | grep -c '^Z' || true)
+
+        echo ""
+        echo "Remaining zombies: $REMAINING"
+        echo "REMEDIATION_STATUS: ZOMBIE_REAP_ATTEMPTED"
+
+      args:
+        executable: /bin/bash
+
+      register: zombie_result
+      changed_when: true
+
+      tags:
+        - remediate
+
+
+    - name: "STAGE 2 - Show zombie reap output"
+      ansible.builtin.debug:
+        var: zombie_result.stdout_lines
+
+      tags:
+        - remediate
+
+
+    - name: "STAGE 2 - Publish zombie reap output"
+      ansible.builtin.set_stats:
+        data:
+          stage2_output: "{{ zombie_result.stdout | default('') }}"
+
+      tags:
+        - remediate
+
+
+    # ============================================================
+    # STAGE 3: SIGNAL RUNAWAY NON-PROTECTED PROCESSES
+    # ============================================================
+
+    - name: "STAGE 3 - Signal newest runaway non-protected instances"
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        echo "============================================================"
+        echo "        STAGE 3: SIGNAL RUNAWAY INSTANCES"
+        echo "============================================================"
+
+        TOP_DUP_LINE=$(ps -eo comm= | sort | uniq -c | sort -rn | head -n 1)
+        TOP_DUP_NAME=$(echo "$TOP_DUP_LINE" | awk '{print $2}')
+
+        echo "Target Command : $TOP_DUP_NAME"
+
+        # Newest instances first (highest PID), capped at the batch size.
+        TARGET_PIDS=$(ps -eo pid=,comm=,etimes= | awk -v n="$TOP_DUP_NAME" '$2==n {print $1, $3}' \
+          | sort -k2,2n | awk '{print $1}' | head -n {{ runaway_kill_batch_size }})
+
+        if [ -z "$TARGET_PIDS" ]; then
+          echo "No matching instances found."
+          echo "REMEDIATION_STATUS: NOT_REQUIRED"
+          exit 0
+        fi
+
+        echo "Targeting PIDs:"
+        echo "$TARGET_PIDS"
+
+        for PID in $TARGET_PIDS; do
+
+          echo ""
+          echo "Sending SIGTERM to PID $PID..."
+          kill -15 "$PID" 2>/dev/null || true
+
+        done
+
+        sleep 3
+
+        STILL_RUNNING=0
+
+        for PID in $TARGET_PIDS; do
+          if kill -0 "$PID" 2>/dev/null; then
+            echo "PID $PID still running, sending SIGKILL..."
+            kill -9 "$PID" 2>/dev/null || true
+            STILL_RUNNING=$((STILL_RUNNING + 1))
+          fi
+        done
+
+        sleep 1
+
+        FINAL_RUNNING=0
+
+        for PID in $TARGET_PIDS; do
+          if kill -0 "$PID" 2>/dev/null; then
+            FINAL_RUNNING=$((FINAL_RUNNING + 1))
+          fi
+        done
+
+        if [ "$FINAL_RUNNING" -eq 0 ]; then
+          echo "REMEDIATION_STATUS: SUCCESS"
+        else
+          echo "REMEDIATION_STATUS: FAILED"
+        fi
+
+      args:
+        executable: /bin/bash
+
+      register: runaway_result
+      changed_when: true
+
+      when:
+        - load_runaway_candidate | default(false) | bool
+        - not (load_runaway_protected | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    - name: "STAGE 3 - Show runaway signal output"
+      ansible.builtin.debug:
+        var: runaway_result.stdout_lines
+
+      when:
+        - load_runaway_candidate | default(false) | bool
+        - not (load_runaway_protected | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    - name: "STAGE 3 - Publish remediation output"
+      ansible.builtin.set_stats:
+        data:
+          remediation_output: "{{ runaway_result.stdout | default('') }}"
+
+      when:
+        - load_runaway_candidate | default(false) | bool
+        - not (load_runaway_protected | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    # ============================================================
+    # STAGE 4: VALIDATE LOAD RECOVERY
+    # ============================================================
+
+    - name: "STAGE 4 - Poll load-per-core until recovery"
+      ansible.builtin.shell: |
+        LOAD1=$(awk '{print $1}' /proc/loadavg)
+        CORES=$(nproc)
+        awk -v l="$LOAD1" -v c="$CORES" 'BEGIN { printf "%.2f", l / c }'
+      args:
+        executable: /bin/bash
+
+      register: load_check
+
+      changed_when: false
+      failed_when: false
+
+      until:
+        - (load_check.stdout | default('99') | float) < load_recover_threshold_per_core
+
+      retries: 6
+      delay: 5
+
+      tags:
+        - validate
+
+
+    # ============================================================
+    # RECORD HEAL RESULT
+    # ============================================================
+
+    - name: "STAGE 4 - Record heal result"
+      ansible.builtin.shell: |
+        mkdir -p "$(dirname "{{ heal_log_path }}")"
+
+        LOAD_VALUE="{{ load_check.stdout | default('99') | trim }}"
+
+        if awk "BEGIN {exit !($LOAD_VALUE < {{ load_recover_threshold_per_core }})}"; then
+          STATUS="HEALED"
+        else
+          STATUS="HEAL_FAILED"
+        fi
+
+        echo "$(date '+%Y-%m-%d %H:%M:%S %Z') [$STATUS high_load_average] $(hostname)" \
+          >> "{{ heal_log_path }}"
+
+      args:
+        executable: /bin/bash
+
+      changed_when: true
+
+      tags:
+        - validate
+
+
+    # ============================================================
+    # FINAL RESULT
+    # ============================================================
+
+    - name: "STAGE 4 - Report final outcome"
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            'HEAL_CONFIRMED_LOAD_BELOW_THRESHOLD'
+            if (load_check.stdout | default('99') | float) < load_recover_threshold_per_core
+            else
+            'HEAL_FAILED_LOAD_STILL_ELEVATED'
+          }}
+
+      tags:
+        - validate

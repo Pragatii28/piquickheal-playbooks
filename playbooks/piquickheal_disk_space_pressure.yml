@@ -1,0 +1,514 @@
+---
+# PiQuickHeal - Disk Space / Inode Pressure Diagnosis and Remediation
+#
+# AWX Job Templates:
+#
+# 1. piquickheal-disk_space_pressure-diagnose
+#    Job Tags: diagnose
+#
+# 2. piquickheal-disk_space_pressure-remediate
+#    Job Tags: remediate,validate
+#
+# Workflow:
+#
+# Diagnose → Approval → Remediate → Validate
+#
+# {{ mount_path }} is passed as an extra_var by PiQuickHeal on every launch —
+# the mount point reported by the disk-usage alert (defaults to "/" when the
+# alert did not name a specific mount).
+#
+# AWX:
+# Use the Limit field to select a specific host.
+
+- name: PiQuickHeal - Disk Space Pressure
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+
+    mount_path: "/"
+
+    # % used (bytes or inodes, whichever is worse), below which the mount
+    # is considered recovered.
+    disk_recover_threshold: 85
+
+    # Rotated/compressed logs older than this are safe to remove outright.
+    log_retention_days: 14
+
+    # Emergency truncation bound for STAGE 3 (a non-protected plain-text
+    # log is truncated down to this many lines, never deleted).
+    truncate_tail_lines: 2000
+
+    # Paths that must never be scanned as truncation/cleanup targets:
+    # live database storage, container runtime state, and core OS paths.
+    protected_paths:
+      - /var/lib/mysql
+      - /var/lib/postgresql
+      - /var/lib/mongodb
+      - /var/lib/docker
+      - /var/lib/containerd
+      - /var/lib/kubelet
+      - /var/lib/etcd
+      - /boot
+      - /etc
+      - /root
+
+    heal_log_path: /var/log/piquickheal/heal.log
+
+  tasks:
+
+    # ============================================================
+    # STAGE 1: DIAGNOSE
+    # ============================================================
+
+    - name: "STAGE 1 - Diagnose disk space and inode usage"
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        echo "============================================================"
+        echo "        PIQUICKHEAL - DISK SPACE PRESSURE DIAGNOSIS"
+        echo "============================================================"
+
+        MOUNT="{{ mount_path }}"
+
+        echo ""
+        echo "[1] MOUNT TARGET"
+        echo "------------------------------------------------------------"
+        echo "Mount: $MOUNT"
+
+        echo ""
+        echo "[2] BYTE USAGE"
+        echo "------------------------------------------------------------"
+
+        df -h "$MOUNT"
+
+        USED_PCT=$(df -P "$MOUNT" | awk 'NR==2 {gsub("%","",$5); print $5}')
+
+        echo "Used (bytes): ${USED_PCT:-UNKNOWN}%"
+
+        echo ""
+        echo "[3] INODE USAGE"
+        echo "------------------------------------------------------------"
+
+        df -iP "$MOUNT"
+
+        USED_INODE_PCT=$(df -iP "$MOUNT" | awk 'NR==2 {gsub("%","",$5); print $5}')
+
+        echo "Used (inodes): ${USED_INODE_PCT:-UNKNOWN}%"
+
+        echo ""
+        echo "[4] TOP 10 SPACE CONSUMERS"
+        echo "------------------------------------------------------------"
+
+        du -xm "$MOUNT" 2>/dev/null | sort -rn | head -n 10 || true
+
+        echo ""
+        echo "[5] TOP SPACE CONSUMER"
+        echo "------------------------------------------------------------"
+
+        TOP_LINE=$(du -xm "$MOUNT" 2>/dev/null | sort -rn | head -n 1)
+        TOP_PATH=$(echo "$TOP_LINE" | awk '{ $1=""; print substr($0,2) }')
+        TOP_SIZE_MB=$(echo "$TOP_LINE" | awk '{print $1}')
+
+        echo "Path : ${TOP_PATH:-UNKNOWN}"
+        echo "Size : ${TOP_SIZE_MB:-0}MB"
+
+        echo ""
+        echo "[6] PROTECTED PATH CHECK"
+        echo "------------------------------------------------------------"
+
+        PROTECTED='{{ protected_paths | join(" ") }}'
+
+        echo "Protected Path List:"
+        echo "$PROTECTED"
+
+        IS_PROTECTED=false
+        PROTECTED_MATCH=""
+
+        for P in $PROTECTED; do
+          case "$TOP_PATH" in
+            "$P"|"$P"/*)
+              IS_PROTECTED=true
+              PROTECTED_MATCH="$P"
+              break
+              ;;
+          esac
+        done
+
+        if [ "$IS_PROTECTED" = true ]; then
+
+          echo ""
+          echo "============================================================"
+          echo "RESULT: PROTECTED PATH"
+          echo "============================================================"
+
+          echo "Protected Path : $PROTECTED_MATCH"
+          echo "Top Consumer   : $TOP_PATH"
+          echo "ACTION         : NO AUTOMATIC REMEDIATION"
+
+          echo ""
+          echo "PROTECTED_PATH_FOUND:${TOP_PATH}"
+
+        else
+
+          echo ""
+          echo "============================================================"
+          echo "RESULT: NON-PROTECTED PATH"
+          echo "============================================================"
+
+          echo "Top Consumer : $TOP_PATH"
+          echo "Size         : ${TOP_SIZE_MB:-0}MB"
+          echo "ACTION       : REMEDIATION MAY BE PROPOSED"
+
+          echo ""
+          echo "Top_path_not_protected:${TOP_PATH}"
+
+        fi
+
+        echo ""
+        echo "============================================================"
+        echo "        END OF DISK SPACE PRESSURE DIAGNOSIS"
+        echo "============================================================"
+
+      args:
+        executable: /bin/bash
+
+      register: diagnose_result
+      changed_when: false
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # DISPLAY DIAGNOSIS OUTPUT
+    # ============================================================
+
+    - name: "STAGE 1 - Show complete diagnosis output"
+      ansible.builtin.debug:
+        var: diagnose_result.stdout_lines
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # CHECK PROTECTED PATH
+    # ============================================================
+
+    - name: "STAGE 1 - Determine whether top consumer is protected"
+      ansible.builtin.set_fact:
+        disk_mount_protected: >-
+          {{ 'PROTECTED_PATH_FOUND' in diagnose_result.stdout }}
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # PUBLISH DIAGNOSIS
+    # ============================================================
+
+    - name: "STAGE 1 - Publish diagnosis result"
+      ansible.builtin.set_stats:
+        data:
+          disk_mount_protected: "{{ disk_mount_protected }}"
+          diagnostic_output: "{{ diagnose_result.stdout }}"
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # STAGE 2: CLEAR SAFE RECLAIMABLE SPACE
+    # ============================================================
+
+    - name: "STAGE 2 - Clear rotated logs, package caches and stale temp files"
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        echo "============================================================"
+        echo "        PIQUICKHEAL - DISK SPACE PRESSURE REMEDIATION"
+        echo "        STAGE 2: CLEAR SAFE RECLAIMABLE SPACE"
+        echo "============================================================"
+
+        MOUNT="{{ mount_path }}"
+
+        BEFORE_KB=$(df -P "$MOUNT" | awk 'NR==2 {print $3}')
+
+        echo ""
+        echo "[1] REMOVING ROTATED/COMPRESSED LOGS OLDER THAN {{ log_retention_days }} DAYS"
+        echo "------------------------------------------------------------"
+
+        find "$MOUNT" -xdev -type f \
+          \( -name "*.gz" -o -name "*.log.[0-9]*" -o -name "*.log.old" \) \
+          -mtime "+{{ log_retention_days }}" \
+          -print -delete 2>/dev/null || true
+
+        echo ""
+        echo "[2] CLEARING PACKAGE MANAGER CACHES"
+        echo "------------------------------------------------------------"
+
+        if command -v apt-get >/dev/null 2>&1; then
+          apt-get clean 2>&1 || true
+        fi
+
+        if command -v yum >/dev/null 2>&1; then
+          yum clean all 2>&1 || true
+        fi
+
+        if command -v dnf >/dev/null 2>&1; then
+          dnf clean all 2>&1 || true
+        fi
+
+        echo ""
+        echo "[3] CLEARING STALE /tmp AND /var/tmp ENTRIES"
+        echo "------------------------------------------------------------"
+
+        find /tmp /var/tmp -mindepth 1 -mmin +60 -delete 2>/dev/null || true
+
+        AFTER_KB=$(df -P "$MOUNT" | awk 'NR==2 {print $3}')
+
+        echo ""
+        echo "Freed: $(( (BEFORE_KB - AFTER_KB) / 1024 ))MB"
+
+        df -h "$MOUNT"
+
+      args:
+        executable: /bin/bash
+
+      register: clear_result
+      changed_when: true
+
+      when:
+        - not (disk_mount_protected | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    - name: "STAGE 2 - Show output"
+      ansible.builtin.debug:
+        var: clear_result.stdout_lines
+
+      when:
+        - not (disk_mount_protected | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    - name: "STAGE 2 - Publish remediation output"
+      ansible.builtin.set_stats:
+        data:
+          stage2_output: "{{ clear_result.stdout | default('') }}"
+
+      when:
+        - not (disk_mount_protected | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    # ============================================================
+    # STAGE 3: ESCALATE - TRUNCATE LARGEST NON-PROTECTED LOG IF
+    # STILL CRITICAL
+    # ============================================================
+
+    - name: "STAGE 3 - Truncate largest non-protected log if still critical"
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        echo "============================================================"
+        echo "        STAGE 3: TRUNCATE IF STILL CRITICAL"
+        echo "============================================================"
+
+        MOUNT="{{ mount_path }}"
+
+        USED_PCT=$(df -P "$MOUNT" | awk 'NR==2 {gsub("%","",$5); print $5}')
+
+        echo "Used: ${USED_PCT:-0}%"
+
+        if [ "${USED_PCT:-0}" -lt {{ disk_recover_threshold }} ]; then
+          echo "Cleanup_sufficient_no_truncation_needed"
+          exit 0
+        fi
+
+        echo ""
+        echo "[1] IDENTIFYING LARGEST NON-PROTECTED LOG FILE"
+        echo "------------------------------------------------------------"
+
+        PROTECTED='{{ protected_paths | join(" ") }}'
+
+        TARGET=""
+        TARGET_SIZE=0
+
+        while read -r SIZE PATH; do
+
+          IS_PROTECTED=false
+
+          for P in $PROTECTED; do
+            case "$PATH" in
+              "$P"|"$P"/*)
+                IS_PROTECTED=true
+                break
+                ;;
+            esac
+          done
+
+          if [ "$IS_PROTECTED" = false ]; then
+            TARGET="$PATH"
+            TARGET_SIZE="$SIZE"
+            break
+          fi
+
+        done <<EOF
+        $(find "$MOUNT" -xdev -type f -name "*.log" -printf '%s %p\n' 2>/dev/null | sort -rn)
+        EOF
+
+        if [ -z "$TARGET" ]; then
+          echo "No non-protected log file found to truncate."
+          echo "REMEDIATION_STATUS: NOT_REQUIRED"
+          exit 0
+        fi
+
+        echo "Target Log : $TARGET"
+        echo "Size (B)   : $TARGET_SIZE"
+
+        echo ""
+        echo "[2] TRUNCATION ACTION"
+        echo "------------------------------------------------------------"
+
+        echo "Truncating $TARGET to last {{ truncate_tail_lines }} lines..."
+
+        TMP_FILE="${TARGET}.piquickheal.tmp"
+
+        tail -n {{ truncate_tail_lines }} "$TARGET" > "$TMP_FILE" 2>/dev/null
+
+        if [ -s "$TMP_FILE" ] || [ ! -s "$TARGET" ]; then
+          cat "$TMP_FILE" > "$TARGET"
+          rm -f "$TMP_FILE"
+          echo "REMEDIATION_STATUS: SUCCESS"
+        else
+          rm -f "$TMP_FILE"
+          echo "REMEDIATION_STATUS: FAILED"
+        fi
+
+        df -h "$MOUNT"
+
+      args:
+        executable: /bin/bash
+
+      register: truncate_result
+      changed_when: true
+
+      when:
+        - not (disk_mount_protected | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    - name: "STAGE 3 - Show output"
+      ansible.builtin.debug:
+        var: truncate_result.stdout_lines
+
+      when:
+        - not (disk_mount_protected | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    - name: "STAGE 3 - Publish remediation output"
+      ansible.builtin.set_stats:
+        data:
+          remediation_output: "{{ truncate_result.stdout | default('') }}"
+
+      when:
+        - not (disk_mount_protected | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    # ============================================================
+    # STAGE 4: VALIDATE DISK RECOVERY
+    # ============================================================
+
+    - name: "STAGE 4 - Poll disk usage until recovery"
+      ansible.builtin.shell: |
+        df -P "{{ mount_path }}" | awk 'NR==2 {gsub("%","",$5); print $5}'
+
+      args:
+        executable: /bin/bash
+
+      register: disk_check
+
+      changed_when: false
+      failed_when: false
+
+      until:
+        - (disk_check.stdout | default('100') | int) < disk_recover_threshold
+
+      retries: 6
+      delay: 5
+
+      when:
+        - not (disk_mount_protected | default(false) | bool)
+
+      tags:
+        - validate
+
+
+    # ============================================================
+    # RECORD HEAL RESULT
+    # ============================================================
+
+    - name: "STAGE 4 - Record heal result"
+      ansible.builtin.shell: |
+        mkdir -p "$(dirname "{{ heal_log_path }}")"
+
+        USED_PCT="{{ disk_check.stdout | default('100') | trim }}"
+
+        if [ "$USED_PCT" -lt {{ disk_recover_threshold }} ]; then
+          STATUS="HEALED"
+        else
+          STATUS="HEAL_FAILED"
+        fi
+
+        echo "$(date '+%Y-%m-%d %H:%M:%S %Z') [$STATUS disk_space_pressure:{{ mount_path }}] $(hostname)" \
+          >> "{{ heal_log_path }}"
+
+      args:
+        executable: /bin/bash
+
+      changed_when: true
+
+      when:
+        - not (disk_mount_protected | default(false) | bool)
+
+      tags:
+        - validate
+
+
+    # ============================================================
+    # FINAL RESULT
+    # ============================================================
+
+    - name: "STAGE 4 - Report final outcome"
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            'HEAL_CONFIRMED_DISK_BELOW_THRESHOLD'
+            if (disk_check.stdout | default('100') | int) < disk_recover_threshold
+            else
+            'HEAL_FAILED_DISK_STILL_CRITICAL'
+          }}
+
+      when:
+        - not (disk_mount_protected | default(false) | bool)
+
+      tags:
+        - validate

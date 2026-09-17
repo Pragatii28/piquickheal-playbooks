@@ -1,0 +1,445 @@
+---
+# PiQuickHeal - Network / DNS Resolution Diagnosis and Remediation
+#
+# AWX Job Templates:
+#
+# 1. piquickheal-network_dns_resolution-diagnose
+#    Job Tags: diagnose
+#
+# 2. piquickheal-network_dns_resolution-remediate
+#    Job Tags: remediate,validate
+#
+# Workflow:
+#
+# Diagnose → Approval → Remediate → Validate
+#
+# Scope: this playbook only ever restarts/flushes the local resolver/cache
+# process (systemd-resolved or nscd). It never touches network interfaces,
+# routes or firewall rules, and never rewrites /etc/resolv.conf. If the
+# default gateway itself is unreachable, that is a network-down condition
+# outside this playbook's safe scope and is reported for manual action.
+#
+# {{ dns_probe_hostname }} is passed as an extra_var by PiQuickHeal (defaults
+# to a stable external anchor) — the name resolved to detect the failure.
+#
+# AWX:
+# Use the Limit field to select a specific host.
+
+- name: PiQuickHeal - Network DNS Resolution
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+
+    dns_probe_hostname: "www.google.com"
+
+    dns_recover_retries: 6
+    dns_recover_delay: 5
+
+    heal_log_path: /var/log/piquickheal/heal.log
+
+  tasks:
+
+    # ============================================================
+    # STAGE 1: DIAGNOSE
+    # ============================================================
+
+    - name: "STAGE 1 - Detect active resolver mechanism"
+      ansible.builtin.shell: |
+        if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+          echo "systemd-resolved"
+        elif systemctl is-active nscd >/dev/null 2>&1; then
+          echo "nscd"
+        else
+          echo "none"
+        fi
+      args:
+        executable: /bin/bash
+      register: resolver_mechanism
+      changed_when: false
+      failed_when: false
+      tags:
+        - diagnose
+
+
+    - name: "STAGE 1 - Diagnose name resolution and gateway reachability"
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        echo "============================================================"
+        echo "        PIQUICKHEAL - NETWORK DNS RESOLUTION DIAGNOSIS"
+        echo "============================================================"
+
+        PROBE="{{ dns_probe_hostname }}"
+        MECHANISM="{{ resolver_mechanism.stdout | trim }}"
+
+        echo ""
+        echo "[1] RESOLVER MECHANISM"
+        echo "------------------------------------------------------------"
+        echo "Detected: ${MECHANISM:-none}"
+
+        echo ""
+        echo "[2] NAME RESOLUTION TEST"
+        echo "------------------------------------------------------------"
+
+        if getent hosts "$PROBE" >/dev/null 2>&1; then
+          RESOLUTION_OK=true
+          echo "Resolution of $PROBE: SUCCESS"
+        else
+          RESOLUTION_OK=false
+          echo "Resolution of $PROBE: FAILED"
+        fi
+
+        echo ""
+        echo "[3] DEFAULT GATEWAY REACHABILITY"
+        echo "------------------------------------------------------------"
+
+        GATEWAY=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
+
+        echo "Gateway: ${GATEWAY:-UNKNOWN}"
+
+        GATEWAY_OK=false
+
+        if [ -n "$GATEWAY" ] && ping -c 1 -W 2 "$GATEWAY" >/dev/null 2>&1; then
+          GATEWAY_OK=true
+          echo "Gateway reachability: SUCCESS"
+        else
+          echo "Gateway reachability: FAILED"
+        fi
+
+        echo ""
+        echo "[4] RESULT"
+        echo "------------------------------------------------------------"
+
+        if [ "$RESOLUTION_OK" = true ]; then
+
+          echo "============================================================"
+          echo "RESULT: RESOLUTION ALREADY WORKING"
+          echo "============================================================"
+          echo "ACTION : NO AUTOMATIC REMEDIATION"
+
+          echo ""
+          echo "RESOLUTION_OK:${PROBE}"
+
+        elif [ "$GATEWAY_OK" = false ]; then
+
+          echo "============================================================"
+          echo "RESULT: GATEWAY UNREACHABLE"
+          echo "============================================================"
+          echo "ACTION : NO AUTOMATIC REMEDIATION (outside safe scope)"
+
+          echo ""
+          echo "RESOLUTION_FAILED_GATEWAY_UNREACHABLE:${GATEWAY:-UNKNOWN}"
+
+        else
+
+          echo "============================================================"
+          echo "RESULT: LOCAL RESOLVER FAILURE"
+          echo "============================================================"
+          echo "Resolver Mechanism : ${MECHANISM:-none}"
+          echo "ACTION             : REMEDIATION MAY BE PROPOSED"
+
+          echo ""
+          echo "RESOLUTION_FAILED_LOCAL_RESOLVER:${MECHANISM:-none}"
+
+        fi
+
+        echo ""
+        echo "============================================================"
+        echo "        END OF NETWORK DNS RESOLUTION DIAGNOSIS"
+        echo "============================================================"
+
+      args:
+        executable: /bin/bash
+
+      register: diagnose_result
+      changed_when: false
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # DISPLAY DIAGNOSIS OUTPUT
+    # ============================================================
+
+    - name: "STAGE 1 - Show complete diagnosis output"
+      ansible.builtin.debug:
+        var: diagnose_result.stdout_lines
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # CHECK RESOLUTION STATE
+    # ============================================================
+
+    - name: "STAGE 1 - Determine whether resolution is already OK"
+      ansible.builtin.set_fact:
+        dns_already_ok: >-
+          {{ 'RESOLUTION_OK' in diagnose_result.stdout }}
+
+      tags:
+        - diagnose
+
+
+    - name: "STAGE 1 - Determine whether the condition is outside safe scope"
+      ansible.builtin.set_fact:
+        dns_manual_action_required: >-
+          {{ 'RESOLUTION_FAILED_GATEWAY_UNREACHABLE' in diagnose_result.stdout }}
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # PUBLISH DIAGNOSIS
+    # ============================================================
+
+    - name: "STAGE 1 - Publish diagnosis result"
+      ansible.builtin.set_stats:
+        data:
+          dns_already_ok: "{{ dns_already_ok }}"
+          dns_manual_action_required: "{{ dns_manual_action_required }}"
+          resolver_mechanism: "{{ resolver_mechanism.stdout | default('none') | trim }}"
+          diagnostic_output: "{{ diagnose_result.stdout }}"
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # STAGE 2: REMEDIATION
+    # ============================================================
+
+    - name: "STAGE 2 - Flush resolver cache"
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        echo "============================================================"
+        echo "        PIQUICKHEAL - NETWORK DNS RESOLUTION REMEDIATION"
+        echo "        STAGE 2: FLUSH RESOLVER CACHE"
+        echo "============================================================"
+
+        MECHANISM="{{ resolver_mechanism.stdout | trim }}"
+
+        case "$MECHANISM" in
+          systemd-resolved)
+            resolvectl flush-caches 2>&1 || systemd-resolve --flush-caches 2>&1 || true
+            ;;
+          nscd)
+            nscd -i hosts 2>&1 || true
+            ;;
+          *)
+            echo "No known resolver cache to flush for mechanism: ${MECHANISM:-none}"
+            ;;
+        esac
+
+        echo ""
+        echo "Re-testing resolution after cache flush..."
+
+        if getent hosts "{{ dns_probe_hostname }}" >/dev/null 2>&1; then
+          echo "FLUSH_RESULT: RESOLVED"
+        else
+          echo "FLUSH_RESULT: STILL_FAILING"
+        fi
+
+      args:
+        executable: /bin/bash
+
+      register: flush_result
+      changed_when: true
+
+      when:
+        - not (dns_already_ok | default(false) | bool)
+        - not (dns_manual_action_required | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    - name: "STAGE 2 - Show flush output"
+      ansible.builtin.debug:
+        var: flush_result.stdout_lines
+
+      when:
+        - not (dns_already_ok | default(false) | bool)
+        - not (dns_manual_action_required | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    - name: "STAGE 2 - Determine whether flush alone resolved it"
+      ansible.builtin.set_fact:
+        dns_flush_resolved: >-
+          {{ 'FLUSH_RESULT: RESOLVED' in (flush_result.stdout | default('')) }}
+
+      when:
+        - not (dns_already_ok | default(false) | bool)
+        - not (dns_manual_action_required | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    - name: "STAGE 3 - Restart local resolver service"
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        echo "============================================================"
+        echo "        STAGE 3: RESTART LOCAL RESOLVER"
+        echo "============================================================"
+
+        MECHANISM="{{ resolver_mechanism.stdout | trim }}"
+
+        case "$MECHANISM" in
+          systemd-resolved)
+            systemctl restart systemd-resolved
+            ;;
+          nscd)
+            systemctl restart nscd
+            ;;
+          *)
+            echo "No known resolver service to restart for mechanism: ${MECHANISM:-none}"
+            echo "REMEDIATION_STATUS: NOT_APPLICABLE"
+            exit 0
+            ;;
+        esac
+
+        sleep 2
+
+        if getent hosts "{{ dns_probe_hostname }}" >/dev/null 2>&1; then
+          echo "REMEDIATION_STATUS: SUCCESS"
+        else
+          echo "REMEDIATION_STATUS: FAILED"
+        fi
+
+      args:
+        executable: /bin/bash
+
+      register: restart_result
+      changed_when: true
+
+      when:
+        - not (dns_already_ok | default(false) | bool)
+        - not (dns_manual_action_required | default(false) | bool)
+        - not (dns_flush_resolved | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    - name: "STAGE 3 - Show restart output"
+      ansible.builtin.debug:
+        var: restart_result.stdout_lines
+
+      when:
+        - not (dns_already_ok | default(false) | bool)
+        - not (dns_manual_action_required | default(false) | bool)
+        - not (dns_flush_resolved | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    - name: "STAGE 3 - Publish remediation output"
+      ansible.builtin.set_stats:
+        data:
+          remediation_output: >-
+            {{
+              restart_result.stdout
+              | default(flush_result.stdout | default(''))
+            }}
+
+      when:
+        - not (dns_already_ok | default(false) | bool)
+        - not (dns_manual_action_required | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    # ============================================================
+    # STAGE 4: VALIDATE RESOLUTION RECOVERY
+    # ============================================================
+
+    - name: "STAGE 4 - Poll resolution until recovery"
+      ansible.builtin.shell: |
+        getent hosts "{{ dns_probe_hostname }}" >/dev/null 2>&1 && echo "OK" || echo "FAILING"
+      args:
+        executable: /bin/bash
+
+      register: dns_check
+
+      changed_when: false
+      failed_when: false
+
+      until:
+        - (dns_check.stdout | default('FAILING') | trim) == 'OK'
+
+      retries: "{{ dns_recover_retries }}"
+      delay: "{{ dns_recover_delay }}"
+
+      when:
+        - not (dns_already_ok | default(false) | bool)
+        - not (dns_manual_action_required | default(false) | bool)
+
+      tags:
+        - validate
+
+
+    # ============================================================
+    # RECORD HEAL RESULT
+    # ============================================================
+
+    - name: "STAGE 4 - Record heal result"
+      ansible.builtin.shell: |
+        mkdir -p "$(dirname "{{ heal_log_path }}")"
+
+        STATE="{{ dns_check.stdout | default('FAILING') | trim }}"
+
+        if [ "$STATE" = "OK" ]; then
+          STATUS="HEALED"
+        else
+          STATUS="HEAL_FAILED"
+        fi
+
+        echo "$(date '+%Y-%m-%d %H:%M:%S %Z') [$STATUS network_dns_resolution] $(hostname)" \
+          >> "{{ heal_log_path }}"
+
+      args:
+        executable: /bin/bash
+
+      changed_when: true
+
+      when:
+        - not (dns_already_ok | default(false) | bool)
+        - not (dns_manual_action_required | default(false) | bool)
+
+      tags:
+        - validate
+
+
+    # ============================================================
+    # FINAL RESULT
+    # ============================================================
+
+    - name: "STAGE 4 - Report final outcome"
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            'HEAL_CONFIRMED_RESOLUTION_OK'
+            if (dns_check.stdout | default('FAILING') | trim) == 'OK'
+            else
+            'HEAL_FAILED_RESOLUTION_STILL_BROKEN'
+          }}
+
+      when:
+        - not (dns_already_ok | default(false) | bool)
+        - not (dns_manual_action_required | default(false) | bool)
+
+      tags:
+        - validate
