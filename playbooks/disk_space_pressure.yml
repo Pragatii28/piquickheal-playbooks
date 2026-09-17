@@ -17,6 +17,16 @@
 # the mount point reported by the disk-usage alert (defaults to "/" when the
 # alert did not name a specific mount).
 #
+# CHANGE LOG (this revision):
+#   Stage 1 no longer picks the mount point itself as the "top consumer"
+#   (du always reports the mount as its own largest line, since it is the
+#   sum of everything under it -- the old logic never got past that line).
+#   It now walks down: find the largest immediate child of mount_path: if
+#   that child is a directory, descend into it and repeat; once the
+#   largest immediate child is a FILE, that file is reported as the true
+#   top consumer. The protected-path check then runs against that file's
+#   full path, so nesting depth no longer matters for detection.
+#
 # AWX:
 # Use the Limit field to select a specific host.
 
