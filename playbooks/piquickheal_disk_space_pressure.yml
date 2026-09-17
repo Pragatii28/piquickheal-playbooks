@@ -116,7 +116,7 @@
         echo "[4] TOP-LEVEL BREAKDOWN OF $MOUNT"
         echo "------------------------------------------------------------"
 
-        du -xm --max-depth=1 "$MOUNT" 2>/dev/null | sort -rn || true
+        du -xam --max-depth=1 "$MOUNT" 2>/dev/null | sort -rn || true
 
         echo ""
         echo "[5] DRILLING DOWN TO FIND TRUE TOP-CONSUMING FILE"
@@ -133,7 +133,10 @@
 
           # Largest immediate child of CURRENT_DIR, excluding its own
           # total line (du always prints the directory itself as one entry).
-          CHILD_LINE=$(du -xm --max-depth=1 "$CURRENT_DIR" 2>/dev/null \
+          # -a is required here: without it, du only lists subdirectories
+          # and silently omits plain files sitting at this level, so a
+          # large standalone file would never be seen as a candidate.
+          CHILD_LINE=$(du -xam --max-depth=1 "$CURRENT_DIR" 2>/dev/null \
             | awk -v d="$CURRENT_DIR" '$2 != d' \
             | sort -rn | head -n 1)
 
