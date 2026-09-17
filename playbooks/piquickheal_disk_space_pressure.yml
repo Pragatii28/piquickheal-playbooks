@@ -17,6 +17,16 @@
 # the mount point reported by the disk-usage alert (defaults to "/" when the
 # alert did not name a specific mount).
 #
+# CHANGE LOG (this revision):
+#   Stage 1 no longer picks the mount point itself as the "top consumer"
+#   (du always reports the mount as its own largest line, since it is the
+#   sum of everything under it — the old logic never got past that line).
+#   It now walks down: find the largest immediate child of mount_path: if
+#   that child is a directory, descend into it and repeat; once the
+#   largest immediate child is a FILE, that file is reported as the true
+#   top consumer. The protected-path check then runs against that file's
+#   full path, so nesting depth no longer matters for detection.
+#
 # AWX:
 # Use the Limit field to select a specific host.
 
@@ -56,6 +66,10 @@
 
     heal_log_path: /var/log/piquickheal/heal.log
 
+    # Safety cap on how many levels the drill-down will descend, in case
+    # of unexpectedly deep or cyclical (symlinked) directory trees.
+    drilldown_max_depth: 25
+
   tasks:
 
     # ============================================================
@@ -71,6 +85,7 @@
         echo "============================================================"
 
         MOUNT="{{ mount_path }}"
+        MAX_DEPTH={{ drilldown_max_depth }}
 
         echo ""
         echo "[1] MOUNT TARGET"
@@ -98,24 +113,76 @@
         echo "Used (inodes): ${USED_INODE_PCT:-UNKNOWN}%"
 
         echo ""
-        echo "[4] TOP 10 SPACE CONSUMERS"
+        echo "[4] TOP-LEVEL BREAKDOWN OF $MOUNT"
         echo "------------------------------------------------------------"
 
-        du -xm "$MOUNT" 2>/dev/null | sort -rn | head -n 10 || true
+        du -xm --max-depth=1 "$MOUNT" 2>/dev/null | sort -rn || true
 
         echo ""
-        echo "[5] TOP SPACE CONSUMER"
+        echo "[5] DRILLING DOWN TO FIND TRUE TOP-CONSUMING FILE"
         echo "------------------------------------------------------------"
 
-        TOP_LINE=$(du -xm "$MOUNT" 2>/dev/null | sort -rn | head -n 1)
-        TOP_PATH=$(echo "$TOP_LINE" | awk '{ $1=""; print substr($0,2) }')
-        TOP_SIZE_MB=$(echo "$TOP_LINE" | awk '{print $1}')
+        CURRENT_DIR="$MOUNT"
+        FINAL_PATH=""
+        FINAL_SIZE_MB=0
+        DEPTH=0
+
+        while [ "$DEPTH" -lt "$MAX_DEPTH" ]; do
+
+          DEPTH=$((DEPTH + 1))
+
+          # Largest immediate child of CURRENT_DIR, excluding CURRENT_DIR's
+          # own total line (du always prints the dir itself as one entry).
+          CHILD_LINE=$(du -xm --max-depth=1 "$CURRENT_DIR" 2>/dev/null \
+            | awk -v d="$CURRENT_DIR" '$2 != d' \
+            | sort -rn | head -n 1)
+
+          if [ -z "$CHILD_LINE" ]; then
+            # No children (empty dir, or permission denied on all entries):
+            # CURRENT_DIR itself is the deepest we can attribute.
+            FINAL_PATH="$CURRENT_DIR"
+            FINAL_SIZE_MB=$(du -xm --max-depth=0 "$CURRENT_DIR" 2>/dev/null | awk '{print $1}')
+            echo "  depth $DEPTH: no children under $CURRENT_DIR - stopping here"
+            break
+          fi
+
+          CHILD_SIZE=$(echo "$CHILD_LINE" | awk '{print $1}')
+          CHILD_PATH=$(echo "$CHILD_LINE" | awk '{ $1=""; print substr($0,2) }')
+
+          echo "  depth $DEPTH: largest child of $CURRENT_DIR -> $CHILD_PATH (${CHILD_SIZE}MB)"
+
+          if [ -f "$CHILD_PATH" ]; then
+            # Reached an actual file - this is the true top consumer.
+            FINAL_PATH="$CHILD_PATH"
+            FINAL_SIZE_MB="$CHILD_SIZE"
+            break
+          elif [ -d "$CHILD_PATH" ]; then
+            # Keep descending into the largest subdirectory.
+            CURRENT_DIR="$CHILD_PATH"
+            FINAL_PATH="$CHILD_PATH"
+            FINAL_SIZE_MB="$CHILD_SIZE"
+            continue
+          else
+            # Socket, device, dangling symlink, etc. - treat as a leaf.
+            FINAL_PATH="$CHILD_PATH"
+            FINAL_SIZE_MB="$CHILD_SIZE"
+            break
+          fi
+
+        done
+
+        TOP_PATH="$FINAL_PATH"
+        TOP_SIZE_MB="$FINAL_SIZE_MB"
+
+        echo ""
+        echo "[6] TOP SPACE CONSUMER (drilled down)"
+        echo "------------------------------------------------------------"
 
         echo "Path : ${TOP_PATH:-UNKNOWN}"
         echo "Size : ${TOP_SIZE_MB:-0}MB"
 
         echo ""
-        echo "[6] PROTECTED PATH CHECK"
+        echo "[7] PROTECTED PATH CHECK"
         echo "------------------------------------------------------------"
 
         PROTECTED='{{ protected_paths | join(" ") }}'
