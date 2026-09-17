@@ -11,16 +11,16 @@
 #
 # Workflow:
 #
-# Diagnose → Approval → Remediate → Validate
+# Diagnose -> Approval -> Remediate -> Validate
 #
-# {{ mount_path }} is passed as an extra_var by PiQuickHeal on every launch —
+# {{ mount_path }} is passed as an extra_var by PiQuickHeal on every launch --
 # the mount point reported by the disk-usage alert (defaults to "/" when the
 # alert did not name a specific mount).
 #
 # CHANGE LOG (this revision):
 #   Stage 1 no longer picks the mount point itself as the "top consumer"
 #   (du always reports the mount as its own largest line, since it is the
-#   sum of everything under it — the old logic never got past that line).
+#   sum of everything under it -- the old logic never got past that line).
 #   It now walks down: find the largest immediate child of mount_path: if
 #   that child is a directory, descend into it and repeat; once the
 #   largest immediate child is a FILE, that file is reported as the true
