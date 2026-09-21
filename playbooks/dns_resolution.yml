@@ -218,7 +218,7 @@
           {{
             dns_resolv_conf_content
             | regex_findall(
-                '(?im)^[ \t]*nameserver[ \t]+([^ \t#;]+)'
+                '(?im)^[ \t]*nameserver[ \t]+([^ \t\r\n#;]+)'
               )
             | unique
             | list
@@ -1025,7 +1025,7 @@
               | b64decode
             )
             | regex_findall(
-                '(?im)^[ \t]*nameserver[ \t]+([^ \t#;]+)'
+                '(?im)^[ \t]*nameserver[ \t]+([^ \t\r\n#;]+)'
               )
             | unique
             | list
