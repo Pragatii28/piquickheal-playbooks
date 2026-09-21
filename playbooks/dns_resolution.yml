@@ -1,941 +1,760 @@
 ---
-# ============================================================
-# PiQuickHeal - Dynamic DNS Resolution Diagnosis & Remediation
+# PiQuickHeal - Unified DNS Resolution Diagnosis
 #
-# Purpose:
-#   Dynamically diagnose DNS resolution failures on Linux hosts.
+# No Python / dig / nc dependency.
 #
-# Supported scenarios:
-#   - DNS resolution working
-#   - No DNS server configured
-#   - Configured DNS server unreachable
-#   - Local resolver/cache failure
-#   - Network/gateway failure
-#   - /etc/hosts override
-#   - External/public DNS comparison
-#   - DNS record/provider related failure
-#   - Unknown DNS failure
+# Detection:
+#   1. RESOLUTION_WORKING
+#   2. CONFIGURED_DNS_SERVER_FAILURE
+#   3. NO_DNS_SERVER_CONFIGURED
+#   4. NETWORK_OR_GATEWAY_FAILURE
+#   5. HOSTS_FILE_OVERRIDE_POSSIBLE
+#   6. LOCAL_RESOLVER_OR_CACHE_FAILURE
+#   7. DNS_RECORD_NOT_FOUND
+#   8. PUBLIC_DNS_UNAVAILABLE / DNS_FAILURE_UNDETERMINED
+#   9. IPV6_DNS_FAILURE
+#  10. DNS_TIMEOUT
 #
-# Safe automatic remediation:
-#   - Flush/restart local resolver services ONLY
+# Safe remediation:
+#   Only local resolver/cache restart/flush.
 #
 # Never automatically modifies:
 #   - /etc/resolv.conf
-#   - NetworkManager DNS settings
-#   - Routes
-#   - Firewall
+#   - routes
+#   - firewall
+#   - interfaces
 #   - DNS records
-# ============================================================
 
-- name: "PiQuickHeal - Dynamic DNS Resolution"
+- name: PiQuickHeal - Unified DNS Resolution Diagnosis
   hosts: all
-  gather_facts: true
   become: true
+  gather_facts: true
 
   vars:
 
-    # --------------------------------------------------------
-    # DNS probes
-    # --------------------------------------------------------
+    # ----------------------------------------------------------
+    # TEST HOSTNAMES
+    # ----------------------------------------------------------
+
     dns_probe_hostname: "example.com"
     dns_secondary_probe_hostname: "cloudflare.com"
 
-    # Public DNS servers used only for diagnosis.
-    # They are NOT configured on the target server.
-    public_dns_servers:
-      - "1.1.1.1"
-      - "8.8.8.8"
+    # Use a hostname that should not normally exist.
+    dns_nonexistent_hostname: "piquickheal-this-domain-should-not-exist-987654321.example"
 
-    # DNS query timeout in seconds.
-    dns_timeout: 3
-
-    # Validation attempts after remediation.
     dns_validation_attempts: 3
-
-    # Delay between validation attempts.
     dns_validation_delay: 2
 
-    # PiQuickHeal heal log.
-    heal_log_path: "/var/log/piquickheal/dns_resolution.log"
+    dns_log_file: "/var/log/piquickheal/dns_resolution.log"
+
+    # ----------------------------------------------------------
+    # OPTIONAL DNS TOOLS
+    #
+    # The playbook does NOT require them.
+    # If available, they improve direct DNS diagnosis.
+    # ----------------------------------------------------------
 
   tasks:
 
-    # ========================================================
-    # STAGE 1 - DISCOVERY
-    # ========================================================
+    # ==========================================================
+    # 1. BASIC INFORMATION
+    # ==========================================================
 
-    - name: "STAGE 1 - Check available DNS diagnostic commands"
+    - name: Display DNS diagnosis start
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "PiQuickHeal - Unified DNS Diagnosis"
+          - "=============================================="
+          - "Target: {{ inventory_hostname }}"
+          - "Hostname: {{ ansible_hostname | default('unknown') }}"
+
+    # ==========================================================
+    # 2. DETECT AVAILABLE DNS UTILITIES
+    # ==========================================================
+
+    - name: Check for dig
       ansible.builtin.shell: |
-        echo "getent=$(command -v getent || true)"
-        echo "dig=$(command -v dig || true)"
-        echo "nslookup=$(command -v nslookup || true)"
-        echo "nc=$(command -v nc || true)"
-        echo "ping=$(command -v ping || true)"
-        echo "ip=$(command -v ip || true)"
+        command -v dig || true
       args:
         executable: /bin/bash
-      register: dns_available_commands
+      register: dig_path
       changed_when: false
-      failed_when: false
-      tags:
-        - diagnose
 
-    - name: "STAGE 1 - Detect active local resolver services"
+    - name: Check for nslookup
       ansible.builtin.shell: |
-        RESULT=""
-
-        for svc in systemd-resolved nscd dnsmasq named bind9; do
-          if systemctl list-unit-files "${svc}.service" >/dev/null 2>&1; then
-            if systemctl is-active --quiet "${svc}.service"; then
-              RESULT="${RESULT}${svc}=ACTIVE "
-            else
-              RESULT="${RESULT}${svc}=INACTIVE "
-            fi
-          fi
-        done
-
-        echo "$RESULT" | xargs
+        command -v nslookup || true
       args:
         executable: /bin/bash
-      register: dns_active_services
+      register: nslookup_path
       changed_when: false
-      failed_when: false
-      tags:
-        - diagnose
 
-    - name: "STAGE 1 - Read /etc/resolv.conf"
+    - name: Check for resolvectl
       ansible.builtin.shell: |
-        if [ -f /etc/resolv.conf ]; then
-          cat /etc/resolv.conf
-        else
-          echo "RESOLV_CONF_MISSING"
-        fi
+        command -v resolvectl || true
       args:
         executable: /bin/bash
-      register: dns_resolv_conf
+      register: resolvectl_path
       changed_when: false
-      failed_when: false
-      tags:
-        - diagnose
 
-    - name: "STAGE 1 - Extract configured nameservers"
+    - name: Set DNS utility facts
+      ansible.builtin.set_fact:
+        dns_has_dig: "{{ dig_path.stdout | trim | length > 0 }}"
+        dns_has_nslookup: "{{ nslookup_path.stdout | trim | length > 0 }}"
+        dns_has_resolvectl: "{{ resolvectl_path.stdout | trim | length > 0 }}"
+
+    - name: Display available DNS tools
+      ansible.builtin.debug:
+        msg:
+          - "dig: {{ dns_has_dig }}"
+          - "nslookup: {{ dns_has_nslookup }}"
+          - "resolvectl: {{ dns_has_resolvectl }}"
+
+    # ==========================================================
+    # 3. READ /etc/resolv.conf
+    # ==========================================================
+
+    - name: Read resolv.conf
+      ansible.builtin.slurp:
+        src: /etc/resolv.conf
+      register: resolv_conf
+      failed_when: false
+
+    - name: Decode resolv.conf
+      ansible.builtin.set_fact:
+        resolv_conf_content: >-
+          {{
+            (resolv_conf.content | default('') | b64decode)
+            if resolv_conf.content is defined
+            else ''
+          }}
+
+    - name: Extract configured nameservers
       ansible.builtin.shell: |
-        if [ -f /etc/resolv.conf ]; then
-          awk '
-            /^[[:space:]]*nameserver[[:space:]]+/ {
-              print $2
-            }
-          ' /etc/resolv.conf
-        fi
+        awk '
+          /^[[:space:]]*#/ {next}
+          $1 == "nameserver" {print $2}
+        ' /etc/resolv.conf 2>/dev/null
       args:
         executable: /bin/bash
-      register: dns_nameservers
+      register: configured_nameservers
       changed_when: false
       failed_when: false
-      tags:
-        - diagnose
 
-    - name: "STAGE 1 - Detect default route"
+    - name: Set DNS nameserver list
+      ansible.builtin.set_fact:
+        dns_nameservers: "{{ configured_nameservers.stdout_lines | default([]) }}"
+
+    - name: Display DNS configuration
+      ansible.builtin.debug:
+        msg:
+          - "Nameservers:"
+          - >-
+            {{
+              dns_nameservers | join(', ')
+              if dns_nameservers | length > 0
+              else 'NONE'
+            }}
+          - "resolv.conf:"
+          - "{{ resolv_conf_content }}"
+
+    # ==========================================================
+    # 4. DETECT LOCAL RESOLVER
+    # ==========================================================
+
+    - name: Detect local resolver services
       ansible.builtin.shell: |
-        ip route show default 2>/dev/null | head -1
+        systemctl list-units \
+          --type=service \
+          --all \
+          --no-legend \
+          2>/dev/null |
+        awk '{print $1}' |
+        grep -Ei \
+          '^(systemd-resolved|nscd|dnsmasq|named|bind9|unbound)' \
+        || true
       args:
         executable: /bin/bash
-      register: dns_default_route
+      register: resolver_services
       changed_when: false
       failed_when: false
-      tags:
-        - diagnose
 
-    - name: "STAGE 1 - Detect default gateway"
+    - name: Display resolver services
+      ansible.builtin.debug:
+        msg:
+          - >-
+            {{
+              resolver_services.stdout_lines
+              if resolver_services.stdout_lines | length > 0
+              else ['No dedicated local DNS resolver detected']
+            }}
+
+    # ==========================================================
+    # 5. DEFAULT ROUTE
+    # ==========================================================
+
+    - name: Get default route
+      ansible.builtin.shell: |
+        ip route show default 2>/dev/null | head -n 1
+      args:
+        executable: /bin/bash
+      register: default_route
+      changed_when: false
+      failed_when: false
+
+    - name: Get default gateway
       ansible.builtin.shell: |
         ip route show default 2>/dev/null |
-        awk '
-          /^default/ {
-            for (i=1; i<=NF; i++) {
-              if ($i == "via") {
-                print $(i+1)
-                exit
-              }
-            }
-          }
-        '
+        awk '/default/ {print $3; exit}'
       args:
         executable: /bin/bash
-      register: dns_gateway
+      register: gateway_result
       changed_when: false
       failed_when: false
-      tags:
-        - diagnose
 
-    - name: "STAGE 1 - Detect default interface"
+    - name: Set gateway fact
+      ansible.builtin.set_fact:
+        dns_gateway: "{{ gateway_result.stdout | trim }}"
+
+    - name: Test default gateway
       ansible.builtin.shell: |
-        ip route show default 2>/dev/null |
-        awk '
-          /^default/ {
-            for (i=1; i<=NF; i++) {
-              if ($i == "dev") {
-                print $(i+1)
-                exit
-              }
-            }
-          }
-        '
-      args:
-        executable: /bin/bash
-      register: dns_default_interface
-      changed_when: false
-      failed_when: false
-      tags:
-        - diagnose
-
-    - name: "STAGE 1 - Check /etc/hosts for probe override"
-      ansible.builtin.shell: |
-        if [ -f /etc/hosts ]; then
-          grep -E '(^|[[:space:]]){{ dns_probe_hostname | regex_escape }}([[:space:]]|$)' \
-            /etc/hosts || true
-        fi
-      args:
-        executable: /bin/bash
-      register: dns_hosts_override
-      changed_when: false
-      failed_when: false
-      tags:
-        - diagnose
-
-    # ========================================================
-    # STAGE 2 - NETWORK DIAGNOSIS
-    # ========================================================
-
-    - name: "STAGE 2 - Test default gateway"
-      ansible.builtin.shell: |
-        GATEWAY="{{ dns_gateway.stdout | trim }}"
-
-        if [ -z "$GATEWAY" ]; then
+        if [ -z "{{ dns_gateway }}" ]; then
           echo "NO_GATEWAY"
-          exit 0
-        fi
-
-        if ping -c 2 -W {{ dns_timeout }} "$GATEWAY" >/dev/null 2>&1; then
+        elif ping -c 2 -W 2 "{{ dns_gateway }}" >/dev/null 2>&1; then
           echo "REACHABLE"
         else
           echo "UNREACHABLE"
         fi
       args:
         executable: /bin/bash
-      register: dns_gateway_test
+      register: gateway_test
       changed_when: false
       failed_when: false
-      tags:
-        - diagnose
 
-    - name: "STAGE 2 - Test configured DNS servers with ping"
-      ansible.builtin.shell: |
-        RESULT=""
-
-        for DNS_SERVER in {{ dns_nameservers.stdout_lines | default([]) | join(' ') }}; do
-
-          if ping -c 1 -W {{ dns_timeout }} "$DNS_SERVER" >/dev/null 2>&1; then
-            STATUS="ICMP_OK"
-          else
-            STATUS="ICMP_FAIL"
-          fi
-
-          RESULT="${RESULT}${DNS_SERVER}=${STATUS} "
-        done
-
-        if [ -z "$RESULT" ]; then
-          echo "NO_DNS_SERVERS"
-        else
-          echo "$RESULT" | xargs
-        fi
-      args:
-        executable: /bin/bash
-      register: dns_server_icmp_test
-      changed_when: false
-      failed_when: false
-      tags:
-        - diagnose
-
-    # ========================================================
-    # STAGE 3 - DIRECT DNS TEST WITHOUT DIG/NC
-    #
-    # Uses Python standard library.
-    # This allows the playbook to work on minimal Linux
-    # installations where dig/nc are not installed.
-    # ========================================================
-
-    - name: "STAGE 3 - Direct UDP DNS test using Python"
-      ansible.builtin.shell: |
-        python3 - <<'PY'
-        import socket
-        import struct
-        import random
-        import sys
-
-        hostname = "{{ dns_probe_hostname }}"
-        nameservers = {{ dns_nameservers.stdout_lines | default([]) | to_json }}
-        timeout = {{ dns_timeout }}
-
-        def build_query(name):
-            transaction_id = random.randint(0, 65535)
-
-            flags = 0x0100
-            questions = 1
-            answer_count = 0
-            authority_count = 0
-            additional_count = 0
-
-            header = struct.pack(
-                "!HHHHHH",
-                transaction_id,
-                flags,
-                questions,
-                answer_count,
-                authority_count,
-                additional_count
-            )
-
-            qname = b""
-
-            for label in name.rstrip(".").split("."):
-                encoded = label.encode()
-                qname += bytes([len(encoded)]) + encoded
-
-            qname += b"\x00"
-
-            # QTYPE A = 1
-            # QCLASS IN = 1
-            question = qname + struct.pack("!HH", 1, 1)
-
-            return transaction_id, header + question
-
-        def test_dns(server):
-            try:
-                transaction_id, packet = build_query(hostname)
-
-                sock = socket.socket(
-                    socket.AF_INET,
-                    socket.SOCK_DGRAM
-                )
-
-                sock.settimeout(timeout)
-                sock.sendto(packet, (server, 53))
-
-                response, _ = sock.recvfrom(4096)
-                sock.close()
-
-                if len(response) < 12:
-                    return "INVALID_RESPONSE"
-
-                response_id = struct.unpack("!H", response[:2])[0]
-
-                if response_id != transaction_id:
-                    return "INVALID_TRANSACTION"
-
-                flags = struct.unpack("!H", response[2:4])[0]
-                rcode = flags & 0x000F
-
-                if rcode == 0:
-                    return "DNS_OK"
-
-                if rcode == 3:
-                    return "NXDOMAIN"
-
-                return "DNS_ERROR_RCODE_%s" % rcode
-
-            except socket.timeout:
-                return "TIMEOUT"
-
-            except OSError as exc:
-                return "SOCKET_ERROR_%s" % getattr(exc, "errno", "UNKNOWN")
-
-            except Exception as exc:
-                return "ERROR_%s" % type(exc).__name__
-
-        if not nameservers:
-            print("NO_DNS_SERVERS")
-            sys.exit(0)
-
-        for server in nameservers:
-            print("%s=%s" % (server, test_dns(server)))
-        PY
-      args:
-        executable: /bin/bash
-      register: dns_direct_server_test
-      changed_when: false
-      failed_when: false
-      tags:
-        - diagnose
-
-    - name: "STAGE 3 - Test local DNS with getent"
-      ansible.builtin.shell: |
-        if ! command -v getent >/dev/null 2>&1; then
-          echo "GETENT_NOT_AVAILABLE"
-          exit 0
-        fi
-
-        if getent ahosts "{{ dns_probe_hostname }}" >/dev/null 2>&1; then
-          echo "A_OK"
-        else
-          echo "A_FAIL"
-        fi
-
-        if getent ahosts "{{ dns_secondary_probe_hostname }}" >/dev/null 2>&1; then
-          echo "SECONDARY_OK"
-        else
-          echo "SECONDARY_FAIL"
-        fi
-      args:
-        executable: /bin/bash
-      register: dns_getent_test
-      changed_when: false
-      failed_when: false
-      tags:
-        - diagnose
-
-    # ========================================================
-    # STAGE 4 - PUBLIC DNS COMPARISON
-    # ========================================================
-
-    - name: "STAGE 4 - Test public DNS servers using Python"
-      ansible.builtin.shell: |
-        python3 - <<'PY'
-        import socket
-        import struct
-        import random
-
-        hostname = "{{ dns_probe_hostname }}"
-        public_servers = {{ public_dns_servers | to_json }}
-        timeout = {{ dns_timeout }}
-
-        def build_query(name):
-            transaction_id = random.randint(0, 65535)
-
-            header = struct.pack(
-                "!HHHHHH",
-                transaction_id,
-                0x0100,
-                1,
-                0,
-                0,
-                0
-            )
-
-            qname = b""
-
-            for label in name.rstrip(".").split("."):
-                encoded = label.encode()
-                qname += bytes([len(encoded)]) + encoded
-
-            qname += b"\x00"
-
-            return transaction_id, header + qname + struct.pack("!HH", 1, 1)
-
-        def test(server):
-            try:
-                transaction_id, packet = build_query(hostname)
-
-                sock = socket.socket(
-                    socket.AF_INET,
-                    socket.SOCK_DGRAM
-                )
-
-                sock.settimeout(timeout)
-                sock.sendto(packet, (server, 53))
-
-                response, _ = sock.recvfrom(4096)
-                sock.close()
-
-                if len(response) < 12:
-                    return "INVALID_RESPONSE"
-
-                response_id = struct.unpack("!H", response[:2])[0]
-
-                if response_id != transaction_id:
-                    return "INVALID_TRANSACTION"
-
-                flags = struct.unpack("!H", response[2:4])[0]
-                rcode = flags & 0x000F
-
-                if rcode == 0:
-                    return "DNS_OK"
-
-                if rcode == 3:
-                    return "NXDOMAIN"
-
-                return "DNS_ERROR_RCODE_%s" % rcode
-
-            except socket.timeout:
-                return "TIMEOUT"
-
-            except OSError as exc:
-                return "SOCKET_ERROR_%s" % getattr(exc, "errno", "UNKNOWN")
-
-            except Exception as exc:
-                return "ERROR_%s" % type(exc).__name__
-
-        for server in public_servers:
-            print("%s=%s" % (server, test(server)))
-        PY
-      args:
-        executable: /bin/bash
-      register: dns_public_comparison
-      changed_when: false
-      failed_when: false
-      tags:
-        - diagnose
-
-    # ========================================================
-    # STAGE 5 - DNS RECORD CHECK
-    # ========================================================
-
-    - name: "STAGE 5 - Check DNS record using available tools"
-      ansible.builtin.shell: |
-        if command -v dig >/dev/null 2>&1; then
-
-          echo "METHOD=dig"
-
-          echo "STATUS:"
-          dig +time={{ dns_timeout }} +tries=1 "{{ dns_probe_hostname }}" |
-            awk '/status:/{print $0}'
-
-          echo "ANSWER:"
-          dig +time={{ dns_timeout }} +tries=1 +short A "{{ dns_probe_hostname }}"
-
-        elif command -v nslookup >/dev/null 2>&1; then
-
-          echo "METHOD=nslookup"
-          nslookup "{{ dns_probe_hostname }}"
-
-        else
-
-          echo "METHOD=python"
-          python3 - <<'PY'
-        import socket
-
-        hostname = "{{ dns_probe_hostname }}"
-
-        try:
-            result = socket.getaddrinfo(
-                hostname,
-                None,
-                socket.AF_UNSPEC,
-                socket.SOCK_STREAM
-            )
-
-            addresses = sorted(
-                set(item[4][0] for item in result)
-            )
-
-            print("RESOLVED")
-            for address in addresses:
-                print(address)
-
-        except Exception as exc:
-            print("FAILED")
-            print(type(exc).__name__)
-        PY
-
-        fi
-      args:
-        executable: /bin/bash
-      register: dns_record_test
-      changed_when: false
-      failed_when: false
-      tags:
-        - diagnose
-
-    # ========================================================
-    # STAGE 6 - RESOLVER SERVICE HEALTH
-    # ========================================================
-
-    - name: "STAGE 6 - Check resolver service health"
-      ansible.builtin.shell: |
-        RESULT=""
-
-        for svc in systemd-resolved nscd dnsmasq named bind9; do
-
-          if systemctl list-unit-files "${svc}.service" >/dev/null 2>&1; then
-
-            if systemctl is-active --quiet "${svc}.service"; then
-              RESULT="${RESULT}${svc}=ACTIVE "
-            else
-              RESULT="${RESULT}${svc}=INACTIVE "
-            fi
-
-          fi
-
-        done
-
-        if [ -z "$RESULT" ]; then
-          echo "NO_LOCAL_RESOLVER_SERVICE"
-        else
-          echo "$RESULT" | xargs
-        fi
-      args:
-        executable: /bin/bash
-      register: dns_service_health
-      changed_when: false
-      failed_when: false
-      tags:
-        - diagnose
-
-    # ========================================================
-    # STAGE 7 - DYNAMIC CLASSIFICATION
-    # ========================================================
-
-    - name: "STAGE 7 - Classify DNS condition"
-      ansible.builtin.shell: |
-        GETENT_RESULT="{{ dns_getent_test.stdout | default('') }}"
-        DIRECT_RESULT="{{ dns_direct_server_test.stdout | default('') }}"
-        PUBLIC_RESULT="{{ dns_public_comparison.stdout | default('') }}"
-        GATEWAY_RESULT="{{ dns_gateway_test.stdout | default('') | trim }}"
-        NAMESERVERS="{{ dns_nameservers.stdout | default('') | trim }}"
-        HOST_OVERRIDE="{{ dns_hosts_override.stdout | default('') | trim }}"
-        ROUTE="{{ dns_default_route.stdout | default('') | trim }}"
-
-        CLASS="DNS_FAILURE_UNDETERMINED"
-        REASON="Unable to determine a unique DNS failure category."
-
-        # ----------------------------------------------------
-        # CASE 1 - DNS is working
-        # ----------------------------------------------------
-        if echo "$GETENT_RESULT" | grep -q "A_OK"; then
-
-          CLASS="RESOLUTION_WORKING"
-          REASON="The configured DNS path successfully resolved the probe hostname."
-
-        # ----------------------------------------------------
-        # CASE 2 - No route/gateway
-        # ----------------------------------------------------
-        elif [ -z "$ROUTE" ] || [ "$GATEWAY_RESULT" = "UNREACHABLE" ]; then
-
-          CLASS="NETWORK_OR_GATEWAY_FAILURE"
-          REASON="The host has no usable default route or cannot reach its gateway."
-
-        # ----------------------------------------------------
-        # CASE 3 - No DNS servers configured
-        # ----------------------------------------------------
-        elif [ -z "$NAMESERVERS" ]; then
-
-          CLASS="NO_DNS_SERVER_CONFIGURED"
-          REASON="No nameserver is configured in /etc/resolv.conf."
-
-        # ----------------------------------------------------
-        # CASE 4 - /etc/hosts override
-        # ----------------------------------------------------
-        elif [ -n "$HOST_OVERRIDE" ]; then
-
-          CLASS="HOSTS_FILE_OVERRIDE_POSSIBLE"
-          REASON="The probe hostname has an entry in /etc/hosts."
-
-        # ----------------------------------------------------
-        # CASE 5 - Configured DNS server responds directly,
-        #          but normal local resolution fails.
-        #
-        # This indicates a local resolver/cache/NSS problem.
-        # ----------------------------------------------------
-        elif echo "$DIRECT_RESULT" | grep -Eq '=DNS_OK$|=NXDOMAIN$'; then
-
-          CLASS="LOCAL_RESOLVER_OR_CACHE_FAILURE"
-          REASON="Configured DNS server responds directly, but local name resolution fails."
-
-        # ----------------------------------------------------
-        # CASE 6 - Configured DNS servers fail, while public
-        #          DNS servers work.
-        #
-        # This is the important case for the current test.
-        # ----------------------------------------------------
-        elif echo "$DIRECT_RESULT" | grep -Eq '=TIMEOUT$|=SOCKET_ERROR|=ERROR_' &&
-             echo "$PUBLIC_RESULT" | grep -Eq '=DNS_OK$|=NXDOMAIN$'; then
-
-          CLASS="CONFIGURED_DNS_SERVER_FAILURE"
-          REASON="Configured DNS servers failed to answer while public DNS servers responded."
-
-        # ----------------------------------------------------
-        # CASE 7 - Configured DNS server has ICMP failure and
-        #          local resolution also fails.
-        #
-        # This fallback works even when dig/nc are unavailable.
-        # ----------------------------------------------------
-        elif echo "$DIRECT_RESULT" | grep -Eq '=TIMEOUT$|=SOCKET_ERROR|=ERROR_' &&
-             echo "$GETENT_RESULT" | grep -q "A_FAIL"; then
-
-          CLASS="CONFIGURED_DNS_SERVER_FAILURE"
-          REASON="Configured DNS servers did not respond to direct DNS queries and local DNS resolution failed."
-
-        # ----------------------------------------------------
-        # CASE 8 - Public DNS also unavailable
-        # ----------------------------------------------------
-        elif echo "$PUBLIC_RESULT" | grep -Eq '=TIMEOUT$|=SOCKET_ERROR|=ERROR_' &&
-             echo "$GETENT_RESULT" | grep -q "A_FAIL"; then
-
-          CLASS="NETWORK_OR_EXTERNAL_DNS_FAILURE"
-          REASON="Both configured and public DNS paths failed."
-
-        # ----------------------------------------------------
-        # CASE 9 - DNS failure remains ambiguous
-        # ----------------------------------------------------
-        else
-
-          CLASS="DNS_FAILURE_UNDETERMINED"
-          REASON="DNS resolution failed but available diagnostics were insufficient to identify a unique cause."
-
-        fi
-
-        echo "CLASS=${CLASS}"
-        echo "REASON=${REASON}"
-
-      args:
-        executable: /bin/bash
-      register: dns_classification
-      changed_when: false
-      failed_when: false
-      tags:
-        - diagnose
-
-    # ========================================================
-    # STAGE 7B - EXTRACT CLEAN CLASSIFICATION
-    # ========================================================
-
-    - name: "STAGE 7B - Extract clean DNS classification"
-      ansible.builtin.set_fact:
-        dns_classification_name: >-
-          {{
-            dns_classification.stdout
-            | regex_search('(?m)^CLASS=(.*)$', '\1')
-            | first
-            | default('DNS_FAILURE_UNDETERMINED')
-          }}
-        dns_classification_reason: >-
-          {{
-            dns_classification.stdout
-            | regex_search('(?m)^REASON=(.*)$', '\1')
-            | first
-            | default('Unable to determine DNS failure reason.')
-          }}
-      tags:
-        - diagnose
-
-    - name: "STAGE 7C - Determine safe remediation"
-      ansible.builtin.set_fact:
-        dns_safe_remediation_allowed: >-
-          {{
-            dns_classification_name == 'LOCAL_RESOLVER_OR_CACHE_FAILURE'
-          }}
-      tags:
-        - diagnose
-
-    # ========================================================
-    # STAGE 8 - DIAGNOSTIC SUMMARY
-    # ========================================================
-
-    - name: "STAGE 8 - Display DNS diagnostic summary"
+    - name: Display network status
       ansible.builtin.debug:
         msg:
-          - "============================================================"
-          - "PiQuickHeal DNS Diagnostic Summary"
-          - "============================================================"
-          - "Host: {{ inventory_hostname }}"
-          - "Probe hostname: {{ dns_probe_hostname }}"
-          - "Secondary hostname: {{ dns_secondary_probe_hostname }}"
-          - "Classification: {{ dns_classification_name }}"
-          - "Reason: {{ dns_classification_reason }}"
-          - "Resolver services: {{ dns_active_services.stdout | default('NONE') }}"
-          - "Nameservers: {{ dns_nameservers.stdout | default('NONE') | trim }}"
-          - "Default route: {{ dns_default_route.stdout | default('NONE') | trim }}"
-          - "Gateway: {{ dns_gateway.stdout | default('NONE') | trim }}"
-          - "Gateway test: {{ dns_gateway_test.stdout | default('UNKNOWN') | trim }}"
-          - "DNS ICMP test: {{ dns_server_icmp_test.stdout | default('UNKNOWN') | trim }}"
-          - "Direct DNS test: {{ dns_direct_server_test.stdout | default('UNKNOWN') | trim }}"
-          - "Local getent test: {{ dns_getent_test.stdout | default('UNKNOWN') | trim }}"
-          - "Public DNS comparison: {{ dns_public_comparison.stdout | default('UNKNOWN') | trim }}"
-          - "Safe remediation allowed: {{ dns_safe_remediation_allowed }}"
-          - "============================================================"
-      tags:
-        - diagnose
+          - "Default route: {{ default_route.stdout | trim | default('NONE') }}"
+          - "Gateway: {{ dns_gateway | default('NONE') }}"
+          - "Gateway test: {{ gateway_test.stdout | trim }}"
 
-    # ========================================================
-    # STAGE 9 - SAFE LOCAL RESOLVER REMEDIATION
-    # ========================================================
+    # ==========================================================
+    # 6. /etc/hosts OVERRIDE
+    #
+    # Do NOT use `getent hosts` for this detection.
+    # Your target demonstrated that it can return AAAA records.
+    # ==========================================================
 
-    - name: "STAGE 9 - Flush systemd-resolved cache"
-      ansible.builtin.command:
-        cmd: "resolvectl flush-caches"
-      when:
-        - dns_safe_remediation_allowed | bool
-        - "'systemd-resolved=ACTIVE' in dns_active_services.stdout"
-      register: dns_resolved_flush
-      changed_when: true
+    - name: Check /etc/hosts for probe hostname
+      ansible.builtin.shell: |
+        awk '
+          /^[[:space:]]*#/ {next}
+          {
+            for (i=2; i<=NF; i++) {
+              if (tolower($i) == tolower("{{ dns_probe_hostname }}")) {
+                print $0
+              }
+            }
+          }
+        ' /etc/hosts 2>/dev/null
+      args:
+        executable: /bin/bash
+      register: hosts_override
+      changed_when: false
       failed_when: false
-      tags:
-        - remediate
 
-    - name: "STAGE 9 - Restart systemd-resolved"
+    - name: Set hosts override fact
+      ansible.builtin.set_fact:
+        hosts_override_present: >-
+          {{ hosts_override.stdout | trim | length > 0 }}
+
+    - name: Display hosts override
+      ansible.builtin.debug:
+        msg:
+          - "Hosts override: {{ hosts_override_present }}"
+          - "Matching entries: {{ hosts_override.stdout | default('NONE') }}"
+
+    # ==========================================================
+    # 7. LOCAL IPv4 LOOKUP
+    # ==========================================================
+
+    - name: Test primary IPv4 resolution
+      ansible.builtin.shell: |
+        getent ahostsv4 "{{ dns_probe_hostname }}" 2>/dev/null
+      args:
+        executable: /bin/bash
+      register: primary_ipv4
+      changed_when: false
+      failed_when: false
+
+    - name: Test secondary IPv4 resolution
+      ansible.builtin.shell: |
+        getent ahostsv4 "{{ dns_secondary_probe_hostname }}" 2>/dev/null
+      args:
+        executable: /bin/bash
+      register: secondary_ipv4
+      changed_when: false
+      failed_when: false
+
+    - name: Set IPv4 lookup facts
+      ansible.builtin.set_fact:
+        primary_ipv4_ok: "{{ primary_ipv4.stdout | trim | length > 0 }}"
+        secondary_ipv4_ok: "{{ secondary_ipv4.stdout | trim | length > 0 }}"
+
+    - name: Display IPv4 DNS results
+      ansible.builtin.debug:
+        msg:
+          - "Primary IPv4 lookup: {{ 'A_OK' if primary_ipv4_ok else 'A_FAIL' }}"
+          - >-
+            Secondary IPv4 lookup:
+            {{ 'A_OK' if secondary_ipv4_ok else 'A_FAIL' }}
+
+    # ==========================================================
+    # 8. IPv6 / AAAA LOOKUP
+    # ==========================================================
+
+    - name: Test IPv6 resolution
+      ansible.builtin.shell: |
+        getent ahostsv6 "{{ dns_probe_hostname }}" 2>/dev/null
+      args:
+        executable: /bin/bash
+      register: primary_ipv6
+      changed_when: false
+      failed_when: false
+
+    - name: Set IPv6 lookup fact
+      ansible.builtin.set_fact:
+        primary_ipv6_ok: "{{ primary_ipv6.stdout | trim | length > 0 }}"
+
+    - name: Display IPv6 DNS result
+      ansible.builtin.debug:
+        msg:
+          - "IPv6 lookup: {{ 'AAAA_OK' if primary_ipv6_ok else 'AAAA_FAIL' }}"
+
+    # ==========================================================
+    # 9. NONEXISTENT RECORD TEST
+    #
+    # If a normal hostname works but a definitely nonexistent
+    # hostname fails, this strongly indicates NXDOMAIN/record
+    # absence rather than DNS service failure.
+    # ==========================================================
+
+    - name: Test nonexistent hostname
+      ansible.builtin.shell: |
+        getent ahostsv4 "{{ dns_nonexistent_hostname }}" 2>/dev/null
+      args:
+        executable: /bin/bash
+      register: nonexistent_lookup
+      changed_when: false
+      failed_when: false
+
+    - name: Set nonexistent record fact
+      ansible.builtin.set_fact:
+        nonexistent_record_failed: >-
+          {{ nonexistent_lookup.stdout | trim | length == 0 }}
+
+    - name: Display nonexistent record result
+      ansible.builtin.debug:
+        msg:
+          - >-
+            Nonexistent hostname lookup:
+            {{
+              'NOT_FOUND'
+              if nonexistent_record_failed
+              else 'RESOLVED_UNEXPECTEDLY'
+            }}
+
+    # ==========================================================
+    # 10. OPTIONAL DIRECT DNS TEST
+    #
+    # Used only if dig/nslookup/resolvectl already exists.
+    # No installation is attempted.
+    # ==========================================================
+
+    - name: Direct DNS test with dig
+      ansible.builtin.shell: |
+        dig +time=3 +tries=1 +short "{{ dns_probe_hostname }}"
+      args:
+        executable: /bin/bash
+      register: dig_result
+      changed_when: false
+      failed_when: false
+      when: dns_has_dig
+
+    - name: Direct DNS test with nslookup
+      ansible.builtin.shell: |
+        timeout 5 nslookup "{{ dns_probe_hostname }}" 2>&1
+      args:
+        executable: /bin/bash
+      register: nslookup_result
+      changed_when: false
+      failed_when: false
+      when:
+        - not dns_has_dig
+        - dns_has_nslookup
+
+    # ==========================================================
+    # 11. TEST EACH CONFIGURED DNS SERVER IF DIG EXISTS
+    # ==========================================================
+
+    - name: Test each configured DNS server with dig
+      ansible.builtin.shell: |
+        result=$(dig +time=3 +tries=1 @"{{ item }}" "{{ dns_probe_hostname }}" 2>&1)
+
+        if echo "$result" | grep -q "status: NOERROR"; then
+          echo "{{ item }}=DNS_OK"
+        elif echo "$result" | grep -q "status: NXDOMAIN"; then
+          echo "{{ item }}=NXDOMAIN"
+        elif echo "$result" | grep -q "status: SERVFAIL"; then
+          echo "{{ item }}=SERVFAIL"
+        elif echo "$result" | grep -qi "connection timed out\|communications error"; then
+          echo "{{ item }}=TIMEOUT"
+        else
+          echo "{{ item }}=DNS_ERROR"
+        fi
+      args:
+        executable: /bin/bash
+      loop: "{{ dns_nameservers }}"
+      register: direct_dns_servers
+      changed_when: false
+      failed_when: false
+      when: dns_has_dig
+
+    - name: Build direct DNS server result
+      ansible.builtin.set_fact:
+        direct_dns_result: >-
+          {{
+            direct_dns_servers.results
+            | default([])
+            | map(attribute='stdout')
+            | map('trim')
+            | list
+            | join('\n')
+          }}
+
+    # ==========================================================
+    # 12. CLASSIFICATION INITIALIZATION
+    # ==========================================================
+
+    - name: Initialize classification
+      ansible.builtin.set_fact:
+        dns_classification_name: "DNS_FAILURE_UNDETERMINED"
+        dns_classification_reason: >-
+          DNS condition could not be uniquely classified using the
+          available operating-system capabilities.
+
+    # ==========================================================
+    # 13. HOSTS FILE OVERRIDE
+    # ==========================================================
+
+    - name: Classify hosts file override
+      ansible.builtin.set_fact:
+        dns_classification_name: "HOSTS_FILE_OVERRIDE_POSSIBLE"
+        dns_classification_reason: >-
+          The probe hostname is explicitly present in /etc/hosts.
+          Local name resolution may therefore bypass DNS.
+      when: hosts_override_present
+
+    # ==========================================================
+    # 14. NETWORK / GATEWAY FAILURE
+    # ==========================================================
+
+    - name: Classify gateway failure
+      ansible.builtin.set_fact:
+        dns_classification_name: "NETWORK_OR_GATEWAY_FAILURE"
+        dns_classification_reason: >-
+          The target has no usable default gateway or the configured
+          gateway is unreachable.
+      when:
+        - not hosts_override_present
+        - gateway_test.stdout | trim != "REACHABLE"
+
+    # ==========================================================
+    # 15. NO DNS SERVER
+    # ==========================================================
+
+    - name: Classify no DNS server
+      ansible.builtin.set_fact:
+        dns_classification_name: "NO_DNS_SERVER_CONFIGURED"
+        dns_classification_reason: >-
+          No nameserver is configured in /etc/resolv.conf.
+      when:
+        - not hosts_override_present
+        - gateway_test.stdout | trim == "REACHABLE"
+        - dns_nameservers | length == 0
+
+    # ==========================================================
+    # 16. DNS RECORD DOES NOT EXIST
+    #
+    # This is only declared when the normal probe resolves but the
+    # intentionally nonexistent hostname does not.
+    # ==========================================================
+
+    - name: Classify nonexistent DNS record
+      ansible.builtin.set_fact:
+        dns_classification_name: "DNS_RECORD_NOT_FOUND"
+        dns_classification_reason: >-
+          Normal DNS resolution works, but the intentionally
+          nonexistent hostname does not resolve. This indicates
+          normal NXDOMAIN/record absence behavior.
+      when:
+        - not hosts_override_present
+        - gateway_test.stdout | trim == "REACHABLE"
+        - dns_nameservers | length > 0
+        - primary_ipv4_ok
+        - nonexistent_record_failed
+
+    # ==========================================================
+    # 17. CONFIGURED DNS SERVER FAILURE
+    #
+    # If direct DNS testing is available.
+    # ==========================================================
+
+    - name: Classify configured DNS failure from direct test
+      ansible.builtin.set_fact:
+        dns_classification_name: "CONFIGURED_DNS_SERVER_FAILURE"
+        dns_classification_reason: >-
+          One or more configured DNS servers failed to answer
+          the direct DNS query.
+      when:
+        - not hosts_override_present
+        - gateway_test.stdout | trim == "REACHABLE"
+        - dns_nameservers | length > 0
+        - dns_has_dig
+        - direct_dns_result is search('=TIMEOUT|=SERVFAIL|=DNS_ERROR')
+
+    # ==========================================================
+    # 18. DNS TIMEOUT
+    #
+    # Explicit timeout classification when dig is available.
+    # ==========================================================
+
+    - name: Classify DNS timeout
+      ansible.builtin.set_fact:
+        dns_classification_name: "DNS_TIMEOUT"
+        dns_classification_reason: >-
+          The configured DNS server did not respond within the
+          configured DNS timeout.
+      when:
+        - not hosts_override_present
+        - gateway_test.stdout | trim == "REACHABLE"
+        - dns_nameservers | length > 0
+        - dns_has_dig
+        - direct_dns_result is search('=TIMEOUT')
+
+    # ==========================================================
+    # 19. LOCAL RESOLVER / CACHE FAILURE
+    #
+    # Direct DNS works, but system lookup fails.
+    # ==========================================================
+
+    - name: Classify local resolver/cache failure
+      ansible.builtin.set_fact:
+        dns_classification_name: "LOCAL_RESOLVER_OR_CACHE_FAILURE"
+        dns_classification_reason: >-
+          DNS servers are responding, but the local NSS/resolver
+          lookup path is failing.
+      when:
+        - not hosts_override_present
+        - gateway_test.stdout | trim == "REACHABLE"
+        - dns_nameservers | length > 0
+        - not primary_ipv4_ok
+        - dns_has_dig
+        - direct_dns_result is search('=DNS_OK')
+
+    # ==========================================================
+    # 20. IPv6-SPECIFIC DNS FAILURE
+    #
+    # A works while AAAA fails.
+    #
+    # This is reported only when an IPv6 lookup is expected to
+    # produce an answer and IPv4 works.
+    # ==========================================================
+
+    - name: Classify IPv6 DNS failure
+      ansible.builtin.set_fact:
+        dns_classification_name: "IPV6_DNS_FAILURE"
+        dns_classification_reason: >-
+          IPv4 DNS resolution works but IPv6/AAAA resolution
+          returned no result.
+      when:
+        - not hosts_override_present
+        - gateway_test.stdout | trim == "REACHABLE"
+        - primary_ipv4_ok
+        - not primary_ipv6_ok
+        - dns_nameservers | length > 0
+
+    # ==========================================================
+    # 21. NORMAL WORKING DNS
+    # ==========================================================
+
+    - name: Classify working DNS
+      ansible.builtin.set_fact:
+        dns_classification_name: "RESOLUTION_WORKING"
+        dns_classification_reason: >-
+          Normal IPv4 DNS resolution succeeded and no /etc/hosts
+          override was detected.
+      when:
+        - not hosts_override_present
+        - gateway_test.stdout | trim == "REACHABLE"
+        - dns_nameservers | length > 0
+        - primary_ipv4_ok
+        - not (
+            primary_ipv4_ok and
+            not primary_ipv6_ok and
+            dns_nameservers | length > 0
+          )
+
+    # ==========================================================
+    # 22. SAFE REMEDIATION DECISION
+    # ==========================================================
+
+    - name: Determine safe remediation
+      ansible.builtin.set_fact:
+        safe_dns_remediation_allowed: >-
+          {{
+            dns_classification_name ==
+            'LOCAL_RESOLVER_OR_CACHE_FAILURE'
+          }}
+
+    # ==========================================================
+    # 23. LOCAL RESOLVER REMEDIATION
+    # ==========================================================
+
+    - name: Check systemd-resolved
+      ansible.builtin.systemd:
+        name: systemd-resolved
+      register: systemd_resolved_status
+      changed_when: false
+      failed_when: false
+
+    - name: Check nscd
+      ansible.builtin.systemd:
+        name: nscd
+      register: nscd_status
+      changed_when: false
+      failed_when: false
+
+    - name: Flush systemd-resolved cache
+      ansible.builtin.command:
+        cmd: resolvectl flush-caches
+      register: resolved_flush
+      changed_when: false
+      failed_when: false
+      when:
+        - safe_dns_remediation_allowed
+        - dns_has_resolvectl
+        - systemd_resolved_status.status is defined
+        - systemd_resolved_status.status.LoadState | default('not-found') == 'loaded'
+
+    - name: Restart systemd-resolved
       ansible.builtin.systemd:
         name: systemd-resolved
         state: restarted
-      when:
-        - dns_safe_remediation_allowed | bool
-        - "'systemd-resolved=ACTIVE' in dns_active_services.stdout"
-      register: dns_resolved_restart
+      register: resolved_restart
       changed_when: true
       failed_when: false
-      tags:
-        - remediate
-
-    - name: "STAGE 9 - Flush nscd hosts cache"
-      ansible.builtin.command:
-        cmd: "nscd -i hosts"
       when:
-        - dns_safe_remediation_allowed | bool
-        - "'nscd=ACTIVE' in dns_active_services.stdout"
-      register: dns_nscd_flush
-      changed_when: true
-      failed_when: false
-      tags:
-        - remediate
+        - safe_dns_remediation_allowed
+        - systemd_resolved_status.status is defined
+        - systemd_resolved_status.status.LoadState | default('not-found') == 'loaded'
 
-    - name: "STAGE 9 - Restart nscd"
+    - name: Restart nscd
       ansible.builtin.systemd:
         name: nscd
         state: restarted
-      when:
-        - dns_safe_remediation_allowed | bool
-        - "'nscd=ACTIVE' in dns_active_services.stdout"
-      register: dns_nscd_restart
+      register: nscd_restart
       changed_when: true
       failed_when: false
-      tags:
-        - remediate
-
-    - name: "STAGE 9 - Restart dnsmasq"
-      ansible.builtin.systemd:
-        name: dnsmasq
-        state: restarted
       when:
-        - dns_safe_remediation_allowed | bool
-        - "'dnsmasq=ACTIVE' in dns_active_services.stdout"
-      register: dns_dnsmasq_restart
-      changed_when: true
-      failed_when: false
-      tags:
-        - remediate
+        - safe_dns_remediation_allowed
+        - nscd_status.status is defined
+        - nscd_status.status.LoadState | default('not-found') == 'loaded'
 
-    # ========================================================
-    # STAGE 10 - VALIDATION
-    # ========================================================
+    # ==========================================================
+    # 24. VALIDATION
+    # ==========================================================
 
-    - name: "STAGE 10 - Validate DNS after remediation"
+    - name: Validate DNS after remediation
       ansible.builtin.shell: |
-        ATTEMPT=1
+        attempt=1
 
-        while [ "$ATTEMPT" -le "{{ dns_validation_attempts }}" ]; do
+        while [ "$attempt" -le "{{ dns_validation_attempts }}" ]; do
 
-          if getent ahosts "{{ dns_probe_hostname }}" >/dev/null 2>&1; then
-            echo "OK"
+          if getent ahostsv4 "{{ dns_probe_hostname }}" >/dev/null 2>&1; then
+            echo "RESOLVED"
             exit 0
           fi
 
-          if [ "$ATTEMPT" -lt "{{ dns_validation_attempts }}" ]; then
-            sleep {{ dns_validation_delay }}
-          fi
+          sleep "{{ dns_validation_delay }}"
+          attempt=$((attempt + 1))
 
-          ATTEMPT=$((ATTEMPT + 1))
         done
 
-        echo "FAILING"
+        echo "FAILED"
         exit 1
       args:
         executable: /bin/bash
       register: dns_validation
       changed_when: false
       failed_when: false
-      when:
-        - dns_safe_remediation_allowed | bool
-      tags:
-        - validate
+      when: safe_dns_remediation_allowed
 
-    # ========================================================
-    # STAGE 11 - RECORD HEAL RESULT
-    # ========================================================
+    - name: Set validation result
+      ansible.builtin.set_fact:
+        dns_validation_result: >-
+          {{
+            dns_validation.stdout | trim
+            if safe_dns_remediation_allowed
+            else 'NOT_REQUIRED'
+          }}
 
-    - name: "STAGE 11 - Record DNS heal result"
-      ansible.builtin.shell: |
-        mkdir -p "$(dirname "{{ heal_log_path }}")"
+    # ==========================================================
+    # 25. LOG
+    # ==========================================================
 
-        if [ "{{ dns_validation.stdout | default('FAILING') | trim }}" = "OK" ]; then
-          STATUS="HEALED"
-        else
-          STATUS="HEAL_FAILED"
-        fi
+    - name: Create PiQuickHeal log directory
+      ansible.builtin.file:
+        path: "{{ dns_log_file | dirname }}"
+        state: directory
+        mode: "0755"
+      failed_when: false
 
-        TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
-        HOSTNAME=$(hostname)
-
-        echo "${TIMESTAMP} [${STATUS} network_dns_resolution] ${HOSTNAME} classification={{ dns_classification_name }} probe={{ dns_probe_hostname }}" >> "{{ heal_log_path }}"
+    - name: Write DNS diagnosis log
+      ansible.builtin.shell: >
+        echo "$(date '+%Y-%m-%d %H:%M:%S')
+        host={{ inventory_hostname }}
+        classification={{ dns_classification_name }}
+        remediation={{ safe_dns_remediation_allowed }}
+        validation={{ dns_validation_result }}"
+        >> "{{ dns_log_file }}"
       args:
         executable: /bin/bash
-      changed_when: true
+      changed_when: false
       failed_when: false
-      when:
-        - dns_safe_remediation_allowed | bool
-      tags:
-        - validate
 
-    # ========================================================
-    # STAGE 12 - MANUAL ACTION REPORT
-    # ========================================================
+    # ==========================================================
+    # 26. FINAL RESULT
+    # ==========================================================
 
-    - name: "STAGE 12 - Generate manual action report"
+    - name: Display final DNS result
       ansible.builtin.debug:
         msg:
-          - "============================================================"
-          - "PiQuickHeal DNS Manual Action Required"
-          - "============================================================"
-          - "Host: {{ inventory_hostname }}"
-          - "Probe: {{ dns_probe_hostname }}"
+          - "=============================================="
+          - "PiQuickHeal DNS Diagnosis Result"
+          - "=============================================="
           - "Classification: {{ dns_classification_name }}"
           - "Reason: {{ dns_classification_reason }}"
-          - ""
-          - "PiQuickHeal did not modify DNS/network configuration."
-          - ""
-          - "Recommended checks:"
-          - "1. Verify /etc/resolv.conf."
-          - "2. Verify configured DNS server availability."
-          - "3. Verify UDP/TCP port 53 connectivity."
-          - "4. Verify firewall/security-group/network ACL rules."
-          - "5. Verify default route and gateway."
-          - "6. Verify DNS records at the DNS provider."
-          - "7. Verify authoritative DNS/delegation."
-          - "8. Check split-horizon/private DNS."
-          - "9. Check DNSSEC if applicable."
-          - "10. Check /etc/hosts."
-          - "11. Check IPv4/IPv6 DNS behaviour."
-          - "============================================================"
-      when:
-        - not (dns_safe_remediation_allowed | bool)
-        - dns_classification_name != 'RESOLUTION_WORKING'
-      tags:
-        - diagnose
-
-    # ========================================================
-    # STAGE 13 - FINAL RESULT
-    # ========================================================
-
-    - name: "STAGE 13 - Final DNS result"
-      ansible.builtin.debug:
-        msg:
-          - "============================================================"
-          - "PiQuickHeal DNS Final Result"
-          - "============================================================"
-          - "Host: {{ inventory_hostname }}"
-          - "Classification: {{ dns_classification_name }}"
-          - "Reason: {{ dns_classification_reason }}"
-          - "Safe remediation: {{ dns_safe_remediation_allowed }}"
-          - "Validation: {{ dns_validation.stdout | default('NOT_REQUIRED') | trim }}"
-          - "============================================================"
-      tags:
-        - diagnose
-        - remediate
-        - validate
+          - "Nameservers: {{ dns_nameservers | join(', ') if dns_nameservers | length > 0 else 'NONE' }}"
+          - "Default route: {{ default_route.stdout | trim | default('NONE') }}"
+          - "Gateway: {{ dns_gateway | default('NONE') }}"
+          - "Gateway test: {{ gateway_test.stdout | trim }}"
+          - "Hosts override: {{ hosts_override_present }}"
+          - "IPv4 resolution: {{ 'A_OK' if primary_ipv4_ok else 'A_FAIL' }}"
+          - "IPv6 resolution: {{ 'AAAA_OK' if primary_ipv6_ok else 'AAAA_FAIL' }}"
+          - "Secondary resolution: {{ 'A_OK' if secondary_ipv4_ok else 'A_FAIL' }}"
+          - "DNS utility available: {{ 'YES' if (dns_has_dig or dns_has_nslookup or dns_has_resolvectl) else 'NO' }}"
+          - "Direct DNS result: {{ direct_dns_result | default('NOT_AVAILABLE') }}"
+          - "Safe remediation: {{ safe_dns_remediation_allowed }}"
+          - "Validation: {{ dns_validation_result }}"
+          - "=============================================="
