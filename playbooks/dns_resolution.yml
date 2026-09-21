@@ -231,7 +231,7 @@
       ansible.builtin.set_fact:
         dns_resolv_conf_is_symlink: >-
           {{
-            dns_resolv_conf_stat.islnk
+            dns_resolv_conf_stat.stat.islnk
             | default(false)
           }}
       tags:
@@ -949,7 +949,7 @@
       when:
         - dns_execution_mode == 'remediate'
         - dns_remediation_action == 'RESTORE_DNS_CONFIG'
-        - dns_resolv_conf_stat.islnk | default(false)
+        - dns_resolv_conf_stat.stat.islnk | default(false)
       tags:
         - remediate
 
