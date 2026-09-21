@@ -6,16 +6,23 @@
 #
 # 1. DNS Diagnose Template
 #    Job Tags: diagnose
-#    Purpose: Read-only diagnosis
+#    Extra Variable:
+#      execution_mode: diagnose
 #
 # 2. DNS Remediation Template
 #    Job Tags: remediate
-#    Purpose: Execute human-approved remediation
+#    Extra Variables:
+#      execution_mode: remediate
+#      approved_dns_action: RESTORE_DNS_CONFIG
+#      approved_dns_servers_input:
+#        - 161.26.0.10
+#        - 161.26.0.11
 #
 # IMPORTANT:
-# - Diagnose tasks NEVER modify the server.
-# - Remediation runs only from the separate AWX remediation template.
-# - Network routes, firewall, interfaces and external DNS records
+# - Diagnosis does not modify DNS/network configuration.
+# - Remediation is hard-blocked unless execution_mode=remediate.
+# - Human approval is required through AWX remediation inputs.
+# - Routes, firewall, interfaces and external DNS records
 #   are NOT automatically modified.
 # ============================================================
 
@@ -27,9 +34,15 @@
 
   vars:
 
-    # --------------------------------------------------------
+    # ========================================================
+    # EXECUTION MODE
+    # ========================================================
+
+    dns_execution_mode: "{{ execution_mode | default('diagnose') }}"
+
+    # ========================================================
     # DNS TEST CONFIGURATION
-    # --------------------------------------------------------
+    # ========================================================
 
     dns_probe_hostname: "example.com"
 
@@ -51,31 +64,44 @@
 
     dns_log_file: "/var/log/piquickheal/dns_resolution.log"
 
-    # --------------------------------------------------------
+    # ========================================================
     # REMEDIATION INPUTS
-    #
-    # These are supplied by the HUMAN / AWX REMEDIATION
-    # TEMPLATE, NOT by the automatic diagnose template.
-    # --------------------------------------------------------
+    # Supplied only by AWX Remediation Template
+    # ========================================================
 
     dns_remediation_action: "{{ approved_dns_action | default('NONE') }}"
 
     approved_dns_servers: "{{ approved_dns_servers_input | default([]) }}"
 
-    # --------------------------------------------------------
+    # ========================================================
     # LOCAL DNS SERVICES
-    # --------------------------------------------------------
+    # ========================================================
 
     dns_local_resolver_services:
-      - "systemd-resolved.service"
-      - "dnsmasq.service"
-      - "unbound.service"
-      - "nscd.service"
+      - "systemd-resolved"
+      - "dnsmasq"
+      - "unbound"
+      - "nscd"
 
   tasks:
 
     # ========================================================
-    # ==================== DIAGNOSIS =========================
+    # EXECUTION MODE VALIDATION
+    # Runs in both templates
+    # ========================================================
+
+    - name: Validate DNS execution mode
+      ansible.builtin.assert:
+        that:
+          - dns_execution_mode in ['diagnose', 'remediate']
+        fail_msg: >-
+          Invalid execution_mode '{{ dns_execution_mode }}'.
+          Supported values are diagnose or remediate.
+      tags:
+        - always
+
+    # ========================================================
+    # ==================== DIAGNOSIS ==========================
     # ========================================================
 
     - name: PiQuickHeal - Confirm DNS diagnosis execution
@@ -88,11 +114,18 @@
           - "Target: {{ dns_target_hostname }}"
           - "Mode: READ ONLY"
           - "=================================================="
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
+    # --------------------------------------------------------
+    # INITIALIZE
+    # --------------------------------------------------------
+
     - name: Initialize DNS diagnosis variables
       ansible.builtin.set_fact:
+
         dns_has_dig: false
         dns_has_nslookup: false
         dns_has_resolvectl: false
@@ -105,8 +138,8 @@
         local_resolver_loopback_configured: false
 
         local_resolver_services: []
-        local_resolver_present: false
         local_resolver_active: false
+        active_local_resolver_services: []
 
         dns_default_route: ""
         dns_gateway: ""
@@ -153,6 +186,8 @@
 
         dns_validation_result: "NOT_REQUIRED"
 
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -166,6 +201,8 @@
       register: dns_dig_check
       changed_when: false
       failed_when: false
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -175,6 +212,8 @@
       register: dns_nslookup_check
       changed_when: false
       failed_when: false
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -184,6 +223,8 @@
       register: dns_resolvectl_check
       changed_when: false
       failed_when: false
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -193,22 +234,26 @@
       register: dns_getent_check
       changed_when: false
       failed_when: false
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
     - name: Set DNS tool availability
       ansible.builtin.set_fact:
-        dns_has_dig: "{{ dns_dig_check.rc == 0 }}"
-        dns_has_nslookup: "{{ dns_nslookup_check.rc == 0 }}"
-        dns_has_resolvectl: "{{ dns_resolvectl_check.rc == 0 }}"
-        dns_has_getent: "{{ dns_getent_check.rc == 0 }}"
+        dns_has_dig: "{{ dns_dig_check.rc | default(1) == 0 }}"
+        dns_has_nslookup: "{{ dns_nslookup_check.rc | default(1) == 0 }}"
+        dns_has_resolvectl: "{{ dns_resolvectl_check.rc | default(1) == 0 }}"
+        dns_has_getent: "{{ dns_getent_check.rc | default(1) == 0 }}"
 
         dns_direct_test_available: >-
           {{
-            dns_dig_check.rc == 0
+            dns_dig_check.rc | default(1) == 0
             or
-            dns_nslookup_check.rc == 0
+            dns_nslookup_check.rc | default(1) == 0
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -220,6 +265,8 @@
           - "resolvectl available: {{ dns_has_resolvectl }}"
           - "getent available: {{ dns_has_getent }}"
           - "Direct DNS testing: {{ dns_direct_test_available }}"
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -232,6 +279,8 @@
         src: /etc/resolv.conf
       register: dns_resolv_conf
       failed_when: false
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -241,6 +290,8 @@
           {{
             dns_resolv_conf.content | default('') | b64decode
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -250,11 +301,13 @@
           {{
             dns_resolv_conf_content
             | regex_findall(
-                '(?im)^[[:space:]]*nameserver[[:space:]]+([^[:space:]#;]+)'
+                '(?im)^[ \t]*nameserver[ \t]+([^ \t#;]+)'
               )
             | unique
             | list
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -277,14 +330,21 @@
             or
             '::1' in dns_nameservers
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
     - name: Display DNS configuration
       ansible.builtin.debug:
         msg:
-          - "resolv.conf nameservers: {{ dns_nameservers | join(', ') if dns_nameservers | length > 0 else 'NONE' }}"
+          - >-
+            resolv.conf nameservers:
+            {{ dns_nameservers | join(', ')
+               if dns_nameservers | length > 0 else 'NONE' }}
           - "Loopback/stub configured: {{ dns_uses_stub_resolver }}"
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -294,18 +354,21 @@
 
     - name: Detect local DNS resolver services
       ansible.builtin.shell: |
-        systemctl list-units \
-          --type=service \
-          --all \
-          --no-legend \
-          --no-pager 2>/dev/null |
-        awk '{print $1}' |
-        grep -E '^(systemd-resolved|dnsmasq|unbound|nscd)\.service$' || true
+        for svc in systemd-resolved dnsmasq unbound nscd; do
+          if systemctl list-unit-files "${svc}.service" \
+             --no-legend --no-pager 2>/dev/null |
+             awk '{print $1}' |
+             grep -qx "${svc}.service"; then
+            echo "${svc}"
+          fi
+        done
       args:
         executable: /bin/bash
       register: local_dns_services_check
       changed_when: false
       failed_when: false
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -323,16 +386,16 @@
 
         local_resolver_present: >-
           {{
-            (
-              local_dns_services_check.stdout_lines
-              | default([])
-              | length
-            ) > 0
+            local_dns_services_check.stdout_lines
+            | default([])
+            | length > 0
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
-    - name: Check active local DNS resolver
+    - name: Check active local DNS resolvers
       ansible.builtin.shell: |
         for svc in systemd-resolved dnsmasq unbound nscd; do
           if systemctl is-active --quiet "$svc" 2>/dev/null; then
@@ -344,25 +407,47 @@
       register: active_local_resolvers
       changed_when: false
       failed_when: false
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
     - name: Set local resolver active state
       ansible.builtin.set_fact:
+        active_local_resolver_services: >-
+          {{
+            active_local_resolvers.stdout_lines
+            | default([])
+            | map('trim')
+            | reject('equalto', '')
+            | unique
+            | list
+          }}
+
         local_resolver_active: >-
           {{
             active_local_resolvers.stdout_lines
             | default([])
             | length > 0
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
     - name: Display local resolver information
       ansible.builtin.debug:
         msg:
-          - "Local resolver services: {{ local_resolver_services | join(', ') if local_resolver_services | length > 0 else 'NONE' }}"
-          - "Local resolver active: {{ local_resolver_active }}"
+          - >-
+            Local resolver services:
+            {{ local_resolver_services | join(', ')
+               if local_resolver_services | length > 0 else 'NONE' }}
+          - >-
+            Active local resolver:
+            {{ active_local_resolver_services | join(', ')
+               if active_local_resolver_services | length > 0 else 'NONE' }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -372,21 +457,24 @@
 
     - name: Read NSS hosts configuration
       ansible.builtin.shell: |
-        awk '$1 == "hosts:" {print; exit}' /etc/nsswitch.conf 2>/dev/null || true
+        awk '$1 == "hosts:" {print; exit}' \
+        /etc/nsswitch.conf 2>/dev/null || true
       args:
         executable: /bin/bash
       register: dns_nss_hosts
       changed_when: false
       failed_when: false
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
     - name: Set NSS hosts order
       ansible.builtin.set_fact:
         dns_nss_hosts_order: >-
-          {{
-            dns_nss_hosts.stdout | default('UNKNOWN') | trim
-          }}
+          {{ dns_nss_hosts.stdout | default('UNKNOWN') | trim }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -400,17 +488,17 @@
       register: dns_default_route_check
       changed_when: false
       failed_when: false
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
     - name: Set default route
       ansible.builtin.set_fact:
         dns_default_route: >-
-          {{
-            dns_default_route_check.stdout
-            | default('')
-            | trim
-          }}
+          {{ dns_default_route_check.stdout | default('') | trim }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -430,22 +518,27 @@
       register: dns_gateway_check
       changed_when: false
       failed_when: false
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
     - name: Set gateway
       ansible.builtin.set_fact:
         dns_gateway: "{{ dns_gateway_check.stdout | default('') | trim }}"
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
     - name: Test gateway reachability
       ansible.builtin.command:
-        cmd: ping -c 1 -W 2 {{ dns_gateway }}
+        cmd: "ping -c 1 -W 2 {{ dns_gateway }}"
       register: dns_gateway_ping
       changed_when: false
       failed_when: false
       when:
+        - dns_execution_mode == 'diagnose'
         - dns_gateway | length > 0
       tags:
         - diagnose
@@ -456,20 +549,20 @@
       register: dns_public_ip_ping
       changed_when: false
       failed_when: false
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
     - name: Set network evidence
       ansible.builtin.set_fact:
         gateway_icmp_reachable: >-
-          {{
-            dns_gateway_ping.rc | default(1) == 0
-          }}
+          {{ dns_gateway_ping.rc | default(1) == 0 }}
 
         internet_icmp_reachable: >-
-          {{
-            dns_public_ip_ping.rc | default(1) == 0
-          }}
+          {{ dns_public_ip_ping.rc | default(1) == 0 }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -488,6 +581,8 @@
             else
             'UNREACHABLE'
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -501,6 +596,8 @@
       register: dns_ipv6_route
       changed_when: false
       failed_when: false
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -513,6 +610,8 @@
       register: dns_ipv6_global
       changed_when: false
       failed_when: false
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -524,6 +623,8 @@
             or
             dns_ipv6_global.stdout | default('') | trim == 'yes'
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -534,27 +635,27 @@
     - name: Check /etc/hosts for DNS target
       ansible.builtin.shell: |
         grep -Ei \
-          '^[[:space:]]*(127\.0\.0\.1|127\.0\.1\.1|::1|[0-9a-fA-F:]+)[[:space:]]+.*\b({{ dns_target_hostname | regex_escape }})\b' \
+          '^[ \t]*(127\.0\.0\.1|127\.0\.1\.1|::1|[0-9a-fA-F:]+)[ \t]+.*\b({{ dns_target_hostname | regex_escape }})\b' \
           /etc/hosts 2>/dev/null || true
       args:
         executable: /bin/bash
       register: dns_hosts_matches
       changed_when: false
       failed_when: false
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
     - name: Set hosts override status
       ansible.builtin.set_fact:
         hosts_matching_entries: >-
-          {{
-            dns_hosts_matches.stdout | default('') | trim
-          }}
+          {{ dns_hosts_matches.stdout | default('') | trim }}
 
         hosts_override_present: >-
-          {{
-            dns_hosts_matches.stdout | default('') | trim | length > 0
-          }}
+          {{ dns_hosts_matches.stdout | default('') | trim | length > 0 }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -564,31 +665,37 @@
 
     - name: Test control hostname IPv4 resolution
       ansible.builtin.command:
-        cmd: getent ahostsv4 {{ dns_probe_hostname }}
+        cmd: "getent ahostsv4 {{ dns_probe_hostname }}"
       register: dns_primary_lookup
       changed_when: false
       failed_when: false
-      when: dns_has_getent
+      when:
+        - dns_execution_mode == 'diagnose'
+        - dns_has_getent
       tags:
         - diagnose
 
     - name: Test secondary hostname IPv4 resolution
       ansible.builtin.command:
-        cmd: getent ahostsv4 {{ dns_secondary_probe_hostname }}
+        cmd: "getent ahostsv4 {{ dns_secondary_probe_hostname }}"
       register: dns_secondary_lookup
       changed_when: false
       failed_when: false
-      when: dns_has_getent
+      when:
+        - dns_execution_mode == 'diagnose'
+        - dns_has_getent
       tags:
         - diagnose
 
     - name: Test target hostname IPv4 resolution
       ansible.builtin.command:
-        cmd: getent ahostsv4 {{ dns_target_hostname }}
+        cmd: "getent ahostsv4 {{ dns_target_hostname }}"
       register: dns_target_lookup
       changed_when: false
       failed_when: false
-      when: dns_has_getent
+      when:
+        - dns_execution_mode == 'diagnose'
+        - dns_has_getent
       tags:
         - diagnose
 
@@ -614,6 +721,8 @@
             and
             dns_target_lookup.stdout | default('') | trim | length > 0
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -623,11 +732,12 @@
 
     - name: Test control hostname IPv6 resolution
       ansible.builtin.command:
-        cmd: getent ahostsv6 {{ dns_probe_hostname }}
+        cmd: "getent ahostsv6 {{ dns_probe_hostname }}"
       register: dns_primary_ipv6_lookup
       changed_when: false
       failed_when: false
       when:
+        - dns_execution_mode == 'diagnose'
         - dns_has_getent
         - ipv6_connectivity_present
       tags:
@@ -641,6 +751,8 @@
             and
             dns_primary_ipv6_lookup.stdout | default('') | trim | length > 0
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -650,11 +762,13 @@
 
     - name: Test nonexistent hostname
       ansible.builtin.command:
-        cmd: getent ahostsv4 {{ dns_nonexistent_hostname }}
+        cmd: "getent ahostsv4 {{ dns_nonexistent_hostname }}"
       register: dns_nonexistent_lookup
       changed_when: false
       failed_when: false
-      when: dns_has_getent
+      when:
+        - dns_execution_mode == 'diagnose'
+        - dns_has_getent
       tags:
         - diagnose
 
@@ -664,7 +778,7 @@
 
     - name: Direct test configured DNS servers using dig
       ansible.builtin.command:
-        cmd: >
+        cmd: >-
           dig +time=3 +tries=1
           {{ dns_probe_hostname }} @{{ item }}
       loop: "{{ dns_nameservers }}"
@@ -672,6 +786,7 @@
       changed_when: false
       failed_when: false
       when:
+        - dns_execution_mode == 'diagnose'
         - dns_has_dig
         - dns_nameservers | length > 0
       tags:
@@ -679,7 +794,7 @@
 
     - name: Direct test configured DNS servers using nslookup
       ansible.builtin.command:
-        cmd: >
+        cmd: >-
           nslookup -timeout=3
           {{ dns_probe_hostname }} {{ item }}
       loop: "{{ dns_nameservers }}"
@@ -687,6 +802,7 @@
       changed_when: false
       failed_when: false
       when:
+        - dns_execution_mode == 'diagnose'
         - not dns_has_dig
         - dns_has_nslookup
         - dns_nameservers | length > 0
@@ -708,6 +824,8 @@
             | list
             | join('\n')
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -717,7 +835,7 @@
 
     - name: Direct target DNS test using dig
       ansible.builtin.command:
-        cmd: >
+        cmd: >-
           dig +time=3 +tries=1
           {{ dns_target_hostname }} @{{ item }}
       loop: "{{ dns_nameservers }}"
@@ -725,6 +843,7 @@
       changed_when: false
       failed_when: false
       when:
+        - dns_execution_mode == 'diagnose'
         - dns_has_dig
         - dns_nameservers | length > 0
       tags:
@@ -732,7 +851,7 @@
 
     - name: Direct target DNS test using nslookup
       ansible.builtin.command:
-        cmd: >
+        cmd: >-
           nslookup -timeout=3
           {{ dns_target_hostname }} {{ item }}
       loop: "{{ dns_nameservers }}"
@@ -740,6 +859,7 @@
       changed_when: false
       failed_when: false
       when:
+        - dns_execution_mode == 'diagnose'
         - not dns_has_dig
         - dns_has_nslookup
         - dns_nameservers | length > 0
@@ -761,6 +881,8 @@
             | list
             | join('\n')
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -770,20 +892,22 @@
 
     - name: Test public DNS using dig
       ansible.builtin.command:
-        cmd: >
+        cmd: >-
           dig +time=3 +tries=1
           {{ dns_public_probe_hostname }} @{{ item }}
       loop: "{{ dns_public_servers }}"
       register: public_dns_dig
       changed_when: false
       failed_when: false
-      when: dns_has_dig
+      when:
+        - dns_execution_mode == 'diagnose'
+        - dns_has_dig
       tags:
         - diagnose
 
     - name: Test public DNS using nslookup
       ansible.builtin.command:
-        cmd: >
+        cmd: >-
           nslookup -timeout=3
           {{ dns_public_probe_hostname }} {{ item }}
       loop: "{{ dns_public_servers }}"
@@ -791,6 +915,7 @@
       changed_when: false
       failed_when: false
       when:
+        - dns_execution_mode == 'diagnose'
         - not dns_has_dig
         - dns_has_nslookup
       tags:
@@ -811,12 +936,14 @@
             | list
             | join('\n')
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
-    # --------------------------------------------------------
+    # ========================================================
     # CLASSIFICATION EVIDENCE
-    # --------------------------------------------------------
+    # ========================================================
 
     - name: Detect public DNS availability
       ansible.builtin.set_fact:
@@ -825,15 +952,15 @@
             dns_direct_test_available
             and
             (
-              public_dns_result is search(
-                '(?i)ANSWER SECTION'
-              )
+              public_dns_result is search('(?i)ANSWER SECTION')
               or
               public_dns_result is search(
                 '(?i)[0-9]{1,3}(\.[0-9]{1,3}){3}'
               )
             )
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -847,6 +974,8 @@
               '(?i)(timed out|timeout|connection timed out)'
             )
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -858,22 +987,18 @@
             and
             dns_nameservers | length > 0
             and
+            direct_dns_result | trim | length > 0
+            and
             not (
-              direct_dns_result is search(
-                '(?i)ANSWER SECTION'
-              )
+              direct_dns_result is search('(?i)ANSWER SECTION')
             )
             and
             not (
-              direct_dns_result is search(
-                '(?i)NXDOMAIN'
-              )
-            )
-            and
-            (
-              direct_dns_result | trim | length > 0
+              direct_dns_result is search('(?i)NXDOMAIN')
             )
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -883,25 +1008,10 @@
           {{
             dns_direct_test_available
             and
-            target_direct_dns_result is search(
-              '(?i)NXDOMAIN'
-            )
+            target_direct_dns_result is search('(?i)NXDOMAIN')
           }}
-      tags:
-        - diagnose
-
-    - name: Detect nonexistent test hostname NXDOMAIN
-      ansible.builtin.set_fact:
-        nonexistent_record_nxdomain: >-
-          {{
-            dns_direct_test_available
-            and
-            direct_dns_result is search(
-              '(?i)NXDOMAIN'
-            )
-            and
-            not primary_ipv4_ok
-          }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -913,6 +1023,8 @@
             and
             not public_dns_available
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -932,6 +1044,8 @@
             and
             not target_ipv4_ok
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -947,6 +1061,8 @@
             and
             not hosts_override_present
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -987,6 +1103,8 @@
           {%- else -%}
           DNS_FAILURE_UNDETERMINED
           {%- endif %}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -1029,6 +1147,8 @@
                 'Available evidence does not uniquely identify the DNS failure cause.'
             }[dns_classification_name]
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -1068,27 +1188,38 @@
           {{
             'Review the matching /etc/hosts entry and remove it only after human approval.'
             if dns_classification_name == 'HOSTS_FILE_OVERRIDE_POSSIBLE'
+
             else 'Investigate network connectivity, routing or upstream network controls.'
             if dns_classification_name == 'NETWORK_OR_GATEWAY_FAILURE'
+
             else 'Configure approved DNS servers.'
             if dns_classification_name == 'NO_DNS_SERVER_CONFIGURED'
+
             else 'Restart the already configured local DNS resolver/cache.'
             if dns_classification_name == 'LOCAL_RESOLVER_OR_CACHE_FAILURE'
+
             else 'Review the configured DNS servers and restore approved DNS configuration.'
             if dns_classification_name in [
               'DNS_TIMEOUT',
               'CONFIGURED_DNS_SERVER_FAILURE'
             ]
+
             else 'Verify/create the DNS record through the approved DNS provider workflow.'
             if dns_classification_name == 'DNS_RECORD_NOT_FOUND'
+
             else 'Investigate the configured/upstream DNS service.'
             if dns_classification_name == 'PUBLIC_DNS_UNAVAILABLE'
+
             else 'Investigate IPv6 DNS/network configuration.'
             if dns_classification_name == 'IPV6_DNS_FAILURE'
+
             else 'No remediation is required.'
             if dns_classification_name == 'RESOLUTION_WORKING'
+
             else 'Review additional DNS/network evidence before remediation.'
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -1102,6 +1233,8 @@
             if dns_recommended_action == 'REMOVE_HOSTS_OVERRIDE'
             else 'HIGH'
           }}
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -1118,12 +1251,18 @@
           - "Classification: {{ dns_classification_name }}"
           - "Reason: {{ dns_classification_reason }}"
           - "Target: {{ dns_target_hostname }}"
-          - "Nameservers: {{ dns_nameservers | join(', ') if dns_nameservers | length > 0 else 'NONE' }}"
+          - >-
+            Nameservers:
+            {{ dns_nameservers | join(', ')
+               if dns_nameservers | length > 0 else 'NONE' }}
           - "Network: {{ dns_network_status }}"
           - "Gateway: {{ dns_gateway if dns_gateway else 'NONE' }}"
           - "Hosts override: {{ hosts_override_present }}"
           - "NSS: {{ dns_nss_hosts_order }}"
-          - "Local resolver: {{ local_resolver_services | join(', ') if local_resolver_services | length > 0 else 'NONE' }}"
+          - >-
+            Local resolver:
+            {{ local_resolver_services | join(', ')
+               if local_resolver_services | length > 0 else 'NONE' }}
           - "Control IPv4: {{ 'OK' if primary_ipv4_ok else 'FAIL' }}"
           - "Secondary IPv4: {{ 'OK' if secondary_ipv4_ok else 'FAIL' }}"
           - "Target IPv4: {{ 'OK' if target_ipv4_ok else 'FAIL' }}"
@@ -1138,6 +1277,8 @@
           - "Risk: {{ dns_recommended_risk }}"
           - "Human approval required: YES"
           - "=================================================="
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -1152,6 +1293,8 @@
         owner: root
         group: root
         mode: "0750"
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
@@ -1177,7 +1320,8 @@
           Local Resolver:
           {{ local_resolver_services | join(', ') if local_resolver_services | length > 0 else 'NONE' }}
 
-          Local Resolver Active: {{ local_resolver_active }}
+          Active Local Resolver:
+          {{ active_local_resolver_services | join(', ') if active_local_resolver_services | length > 0 else 'NONE' }}
 
           Default Route:
           {{ dns_default_route if dns_default_route else 'NONE' }}
@@ -1227,12 +1371,13 @@
           ==========================================================
           END PIQUICKHEAL DNS DIAGNOSIS
           ==========================================================
+      when:
+        - dns_execution_mode == 'diagnose'
       tags:
         - diagnose
 
-
     # ========================================================
-    # =================== REMEDIATION ========================
+    # =================== REMEDIATION =========================
     # ========================================================
 
     - name: Confirm DNS remediation execution
@@ -1242,8 +1387,15 @@
           - "PIQUICKHEAL DNS REMEDIATION"
           - "=================================================="
           - "Host: {{ inventory_hostname }}"
+          - "Execution mode: {{ dns_execution_mode }}"
           - "Approved action: {{ dns_remediation_action }}"
+          - >-
+            Approved DNS servers:
+            {{ approved_dns_servers | join(', ')
+               if approved_dns_servers | length > 0 else 'NONE' }}
           - "=================================================="
+      when:
+        - dns_execution_mode == 'remediate'
       tags:
         - remediate
 
@@ -1260,8 +1412,11 @@
               'REMOVE_HOSTS_OVERRIDE'
             ]
         fail_msg: >-
-          Invalid or unsupported DNS remediation action.
+          Invalid or unsupported DNS remediation action:
+          {{ dns_remediation_action }}.
           No change will be performed.
+      when:
+        - dns_execution_mode == 'remediate'
       tags:
         - remediate
 
@@ -1269,54 +1424,77 @@
     # RESTART LOCAL RESOLVER
     # ========================================================
 
-    - name: Restart systemd-resolved
-      ansible.builtin.systemd:
-        name: systemd-resolved
-        state: restarted
-      register: systemd_resolved_restart
+    - name: Determine active resolver services for remediation
+      ansible.builtin.shell: |
+        for svc in systemd-resolved dnsmasq unbound nscd; do
+          if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            echo "$svc"
+          fi
+        done
+      args:
+        executable: /bin/bash
+      register: remediation_active_resolvers
+      changed_when: false
+      failed_when: false
       when:
+        - dns_execution_mode == 'remediate'
         - dns_remediation_action == 'RESTART_LOCAL_RESOLVER'
       tags:
         - remediate
 
-    - name: Flush systemd-resolved cache
+    - name: Set remediation resolver list
+      ansible.builtin.set_fact:
+        remediation_resolver_services: >-
+          {{
+            remediation_active_resolvers.stdout_lines
+            | default([])
+            | map('trim')
+            | reject('equalto', '')
+            | unique
+            | list
+          }}
+      when:
+        - dns_execution_mode == 'remediate'
+        - dns_remediation_action == 'RESTART_LOCAL_RESOLVER'
+      tags:
+        - remediate
+
+    - name: Validate local resolver exists
+      ansible.builtin.assert:
+        that:
+          - remediation_resolver_services | length > 0
+        fail_msg: >-
+          No active supported local DNS resolver was detected.
+          No resolver restart will be attempted.
+      when:
+        - dns_execution_mode == 'remediate'
+        - dns_remediation_action == 'RESTART_LOCAL_RESOLVER'
+      tags:
+        - remediate
+
+    - name: Restart approved active local DNS resolver
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: restarted
+      loop: "{{ remediation_resolver_services }}"
+      register: resolver_restart_results
+      when:
+        - dns_execution_mode == 'remediate'
+        - dns_remediation_action == 'RESTART_LOCAL_RESOLVER'
+      tags:
+        - remediate
+
+    - name: Flush systemd-resolved cache when applicable
       ansible.builtin.command:
         cmd: resolvectl flush-caches
       register: systemd_resolved_flush
       changed_when: true
       failed_when: false
       when:
+        - dns_execution_mode == 'remediate'
         - dns_remediation_action == 'RESTART_LOCAL_RESOLVER'
-        - systemd_resolved_restart is defined
-        - systemd_resolved_restart.failed is not defined or
-          not systemd_resolved_restart.failed
-      tags:
-        - remediate
-
-    - name: Restart dnsmasq
-      ansible.builtin.systemd:
-        name: dnsmasq
-        state: restarted
-      when:
-        - dns_remediation_action == 'RESTART_LOCAL_RESOLVER'
-      tags:
-        - remediate
-
-    - name: Restart unbound
-      ansible.builtin.systemd:
-        name: unbound
-        state: restarted
-      when:
-        - dns_remediation_action == 'RESTART_LOCAL_RESOLVER'
-      tags:
-        - remediate
-
-    - name: Restart nscd
-      ansible.builtin.systemd:
-        name: nscd
-        state: restarted
-      when:
-        - dns_remediation_action == 'RESTART_LOCAL_RESOLVER'
+        - "'systemd-resolved' in remediation_resolver_services"
+        - dns_has_resolvectl | default(false)
       tags:
         - remediate
 
@@ -1331,13 +1509,14 @@
           - approved_dns_servers | length <= 3
           - >
             approved_dns_servers
-            | select('match', '^[0-9a-fA-F:.]+$')
+            | select('match', '^[0-9A-Fa-f:.]+$')
             | list
             | length == approved_dns_servers | length
         fail_msg: >-
           No valid approved DNS servers were supplied.
           /etc/resolv.conf will not be modified.
       when:
+        - dns_execution_mode == 'remediate'
         - dns_remediation_action == 'RESTORE_DNS_CONFIG'
       tags:
         - remediate
@@ -1348,6 +1527,7 @@
         follow: false
       register: dns_resolv_conf_stat
       when:
+        - dns_execution_mode == 'remediate'
         - dns_remediation_action == 'RESTORE_DNS_CONFIG'
       tags:
         - remediate
@@ -1356,9 +1536,10 @@
       ansible.builtin.fail:
         msg: >-
           /etc/resolv.conf is a symbolic link.
-          The playbook will not overwrite it directly.
+          PiQuickHeal will not overwrite it directly.
           Update the owning DHCP/network/resolver configuration instead.
       when:
+        - dns_execution_mode == 'remediate'
         - dns_remediation_action == 'RESTORE_DNS_CONFIG'
         - dns_resolv_conf_stat.stat.islnk | default(false)
       tags:
@@ -1373,6 +1554,7 @@
         group: root
         mode: "0644"
       when:
+        - dns_execution_mode == 'remediate'
         - dns_remediation_action == 'RESTORE_DNS_CONFIG'
       tags:
         - remediate
@@ -1382,7 +1564,7 @@
         dest: /etc/resolv.conf
         content: |
           # Managed by PiQuickHeal after human approval.
-          # Original:
+          # Original configuration:
           # /etc/resolv.conf.piquickheal-backup
 
           {% for dns_server in approved_dns_servers %}
@@ -1393,6 +1575,7 @@
         mode: "0644"
       register: dns_resolv_conf_remediation
       when:
+        - dns_execution_mode == 'remediate'
         - dns_remediation_action == 'RESTORE_DNS_CONFIG'
       tags:
         - remediate
@@ -1410,6 +1593,7 @@
         group: root
         mode: "0644"
       when:
+        - dns_execution_mode == 'remediate'
         - dns_remediation_action == 'REMOVE_HOSTS_OVERRIDE'
       tags:
         - remediate
@@ -1419,9 +1603,10 @@
         path: /etc/hosts
         state: absent
         regexp: >-
-          ^[[:space:]]*(127\.0\.0\.1|127\.0\.1\.1|::1|[0-9a-fA-F:]+)[[:space:]]+.*\b({{ dns_target_hostname | regex_escape }})\b
+          ^[ \t]*(127\.0\.0\.1|127\.0\.1\.1|::1|[0-9A-Fa-f:]+)[ \t]+.*\b({{ dns_target_hostname | regex_escape }})\b
       register: hosts_remediation
       when:
+        - dns_execution_mode == 'remediate'
         - dns_remediation_action == 'REMOVE_HOSTS_OVERRIDE'
       tags:
         - remediate
@@ -1432,7 +1617,7 @@
 
     - name: Validate DNS after remediation
       ansible.builtin.command:
-        cmd: getent ahostsv4 {{ item }}
+        cmd: "getent ahostsv4 {{ item }}"
       register: dns_validation
       changed_when: false
       failed_when: false
@@ -1442,6 +1627,9 @@
       loop:
         - "{{ dns_probe_hostname }}"
         - "{{ dns_secondary_probe_hostname }}"
+      when:
+        - dns_execution_mode == 'remediate'
+        - dns_has_getent | default(true)
       tags:
         - remediate
 
@@ -1459,6 +1647,8 @@
             else
             'VALIDATION_FAILED'
           }}
+      when:
+        - dns_execution_mode == 'remediate'
       tags:
         - remediate
 
@@ -1484,6 +1674,8 @@
               'DNS remediation was performed but validation failed.'
             }}
           - "=================================================="
+      when:
+        - dns_execution_mode == 'remediate'
       tags:
         - remediate
 
@@ -1508,5 +1700,7 @@
           ==========================================================
           END PIQUICKHEAL DNS REMEDIATION
           ==========================================================
+      when:
+        - dns_execution_mode == 'remediate'
       tags:
         - remediate
