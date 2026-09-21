@@ -377,15 +377,10 @@
       ansible.builtin.set_fact:
         dns_default_gateway: >-
           {{
-            (
-              dns_default_route.stdout
-              | regex_search(
-                  'default via ([0-9a-fA-F:.]+)',
-                  '\\1'
-                )
-              | first
-            )
-            | default('')
+            dns_default_route.stdout
+            | regex_search('default via [0-9a-fA-F:.]+')
+            | default('', true)
+            | regex_replace('^default via ', '')
           }}
       tags:
         - diagnose
