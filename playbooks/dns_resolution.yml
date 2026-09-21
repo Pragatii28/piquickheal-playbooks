@@ -546,7 +546,9 @@
             dns_direct_tests.results | default([])
             | selectattr('rc', 'equalto', 0)
             | selectattr('stdout', 'defined')
-            | selectattr('stdout', 'search', '\\S')
+            | map(attribute='stdout')
+            | map('trim')
+            | reject('equalto', '')
             | list
             | length > 0
           }}
@@ -585,7 +587,10 @@
           {{
             dns_public_tests.results | default([])
             | selectattr('rc', 'equalto', 0)
-            | selectattr('stdout', 'search', '\\S')
+            | selectattr('stdout', 'defined')
+            | map(attribute='stdout')
+            | map('trim')
+            | reject('equalto', '')
             | list
             | length > 0
           }}
