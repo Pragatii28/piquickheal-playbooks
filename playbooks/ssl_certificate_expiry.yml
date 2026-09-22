@@ -943,7 +943,13 @@
         tls_regenerated_count: 0
         tls_changes_made: false
 
+        # Actual remediation state (not merely "an unhealthy certificate exists")
+        tls_automatic_remediation_attempted: false
+        tls_automatic_remediation_failed: false
+        tls_automatic_action_count: 0
+
         tls_manual_action_certificates: []
+        tls_manual_action_required: false
 
         tls_post_remediation_records: []
         tls_post_expired_count: 0
@@ -2612,6 +2618,13 @@
             'NOT_REQUIRED'
             if not (tls_remediation_required | default(false) | bool)
             else
+            'NOT_APPLICABLE'
+            if (
+              (tls_manual_action_certificates | length > 0)
+              and not (tls_automatic_remediation_attempted | bool)
+              and (tls_regenerated_count | int) == 0
+            )
+            else
             'PASSED'
             if (tls_remaining_unhealthy | length) == 0
             else
@@ -2690,6 +2703,46 @@
         - validate
 
 
+    - name: STAGE 26 - Determine actual remediation state
+      ansible.builtin.set_fact:
+        tls_automatic_remediation_attempted: >-
+          {{
+            (
+              tls_allow_remediation | bool
+              and tls_remediation_required | bool
+              and (
+                (tls_primary_renewal_mechanism == 'CERTBOT'
+                 and (tls_certbot_renewal is defined)
+                 and not (tls_certbot_renewal.skipped | default(false) | bool))
+                or
+                (tls_primary_renewal_mechanism == 'CERT_MANAGER'
+                 and (tls_cert_manager_renewal is defined)
+                 and not (tls_cert_manager_renewal.skipped | default(false) | bool))
+                or
+                (tls_primary_renewal_mechanism == 'SYSTEMD'
+                 and (tls_systemd_services.stdout_lines | default([]) | length > 0))
+              )
+            )
+          }}
+        tls_automatic_action_count: >-
+          {{
+            (tls_regenerated_count | int)
+            + (1 if (tls_automatic_remediation_attempted | bool) else 0)
+          }}
+        tls_automatic_remediation_failed: >-
+          {{
+            (
+              tls_automatic_remediation_attempted | bool
+              and (tls_remaining_unhealthy | length > 0)
+            )
+          }}
+        tls_manual_action_required: >-
+          {{ tls_manual_action_certificates | length > 0 }}
+      tags:
+        - remediate
+        - validate
+
+
     - name: STAGE 26 - Determine remediation status
       ansible.builtin.set_fact:
         tls_remediation_status: >-
@@ -2697,8 +2750,24 @@
             'REMEDIATION_DISABLED'
             if not (tls_allow_remediation | bool)
             else
-            'REMEDIATION_ATTEMPTED'
-            if tls_remediation_required | bool
+            'NO_REMEDIATION_REQUIRED'
+            if not (tls_remediation_required | bool)
+            else
+            'REMEDIATED'
+            if (
+              (tls_regenerated_count | int) > 0
+              and (tls_remaining_unhealthy | length) == 0
+            )
+            or (
+              (tls_automatic_remediation_attempted | bool)
+              and (tls_remaining_unhealthy | length) == 0
+            )
+            else
+            'REMEDIATION_FAILED'
+            if tls_automatic_remediation_failed | bool
+            else
+            'MANUAL_ACTION_REQUIRED'
+            if tls_manual_action_required | bool
             else
             'NO_REMEDIATION_REQUIRED'
           }}
@@ -2830,7 +2899,16 @@
             {{ tls_regenerated_count | default(0) }}
 
           piquickheal_manual_action_required: >-
-            {{ tls_manual_action_certificates | length > 0 }}
+            {{ tls_manual_action_required | bool }}
+
+          piquickheal_automatic_remediation_attempted: >-
+            {{ tls_automatic_remediation_attempted | bool }}
+
+          piquickheal_automatic_remediation_failed: >-
+            {{ tls_automatic_remediation_failed | bool }}
+
+          piquickheal_automatic_action_count: >-
+            {{ tls_automatic_action_count | int }}
 
           piquickheal_manual_action_count: >-
             {{ tls_manual_action_certificates | length }}
@@ -2878,6 +2956,10 @@
               else 'Diagnosis: ' ~ tls_diagnosis_status,
 
               'Remediation: ' ~ tls_remediation_status,
+
+              'Automatic remediation attempted: ' ~ (tls_automatic_remediation_attempted | bool),
+
+              'Manual action required: ' ~ (tls_manual_action_required | bool),
 
               'Validation: ' ~ tls_validation_status,
 
